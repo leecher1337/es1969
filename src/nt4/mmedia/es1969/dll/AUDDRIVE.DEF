@@ -1,6 +1,6 @@
-LIBRARY SNDBLST
+LIBRARY AUDDRIVE
 
-DESCRIPTION 'Sound Blaster driver DLL'
+DESCRIPTION 'Configuration driver for ESS'
 
 EXETYPE WINDOWS
 

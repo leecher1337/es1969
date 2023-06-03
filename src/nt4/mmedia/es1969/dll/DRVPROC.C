@@ -85,6 +85,7 @@ BOOL UnlinkSetupAPI();
 LRESULT DriverProc(DWORD dwDriverID, HDRVR hDriver, UINT uiMessage, LPARAM lParam1, LPARAM lParam2)
 {
     LRESULT lr;
+    BOOL bAutoInstall = FALSE;
 
     switch (uiMessage) {
         case DRV_LOAD:
@@ -104,8 +105,8 @@ LRESULT DriverProc(DWORD dwDriverID, HDRVR hDriver, UINT uiMessage, LPARAM lPara
                handle DRV_LOAD
             */
 
-            ghModule = GetDriverModuleHandle(hDriver);
-            DrvLibInit(ghModule, DLL_PROCESS_ATTACH, NULL);
+            hDriverModule1 = DrvGetModuleHandle(hDriver);
+            DrvLibInit(hDriverModule1, DLL_PROCESS_ATTACH, NULL);
             return (LRESULT)1L;
 
         case DRV_FREE:
@@ -123,7 +124,7 @@ LRESULT DriverProc(DWORD dwDriverID, HDRVR hDriver, UINT uiMessage, LPARAM lPara
                Return value is ignored.
             */
 
-            DrvLibInit(ghModule, DLL_PROCESS_DETACH, NULL);
+            DrvLibInit(hDriverModule1, DLL_PROCESS_DETACH, NULL);
             return (LRESULT)1L;
 
         case DRV_OPEN:
@@ -243,7 +244,9 @@ LRESULT DriverProc(DWORD dwDriverID, HDRVR hDriver, UINT uiMessage, LPARAM lPara
                                   FALSE);             // Don't create
             lr = (LRESULT)DrvAccess(&RegAccess);
             DrvCloseServiceManager(&RegAccess);
-
+            DrvQueryDeviceIdParameter(&RegAccess, 0, L"AutoInstall", &bAutoInstall);
+            if (!bInstall || bAutoInstall) 
+                return DRVCNF_CANCEL;
             return lr;
 
         case DRV_CONFIGURE:
@@ -267,15 +270,8 @@ LRESULT DriverProc(DWORD dwDriverID, HDRVR hDriver, UINT uiMessage, LPARAM lPara
                                   SoundDriverTypeNormal,
                                   &RegAccess,
                                   FALSE);             // Don't create
-
-            if (DynalinkSetupAPI()) {
-                lr = (LRESULT)Config((HWND)lParam1, ghModule);
-
-                UnlinkSetupAPI();
-            } else {
-                lr = DRVCNF_CANCEL;
-            }
-
+                                  
+            lr = (LRESULT)Config((HWND)lParam1, hDriverModule1);
             DrvCloseServiceManager(&RegAccess);
 
             return lr;
@@ -324,37 +320,7 @@ LRESULT DriverProc(DWORD dwDriverID, HDRVR hDriver, UINT uiMessage, LPARAM lPara
                 return (LRESULT)DRVCNF_CANCEL;
             }
 
-            if (DynalinkSetupAPI()) {
-                lr = ConfigRemove((HWND)lParam1);
-
-                UnlinkSetupAPI();
-            } else {
-                lr = DRVCNF_CANCEL;
-            }
-
-            DrvCloseServiceManager(&RegAccess);
-
-            return lr;
-
-        case DRV_PNPINSTALL:
-            D3(("DriverProc() - DRV_PNPINSTALL"));
-
-            /*
-             *  Handle Media Class Installer messages for PnP devices
-             */
-            DrvCreateServicesNode(STR_DRIVERNAME,
-                                   SoundDriverTypeNormal,
-                                   &RegAccess,
-                                   FALSE);             // Don't create
-
-            if (DynalinkSetupAPI()) {
-                lr = InstallPnPDevice((HDEVINFO)lParam1,
-                                      (PSP_DEVINFO_DATA)lParam2);
-
-                UnlinkSetupAPI();
-            } else {
-                lr = DRVCNF_CANCEL;
-            }
+            lr = ConfigRemove((HWND)lParam1);
 
             DrvCloseServiceManager(&RegAccess);
 
@@ -365,126 +331,6 @@ LRESULT DriverProc(DWORD dwDriverID, HDRVR hDriver, UINT uiMessage, LPARAM lPara
     }
 }
 
-
-//------------------------------------------------------------------------
-//  BOOL DynalinkSetupAPI
-//
-//  Description:
-//      This routine gets all of the function pointers to the setupapi
-//      and cfgmgr32 procedures that are needed for PnP support.
-//      This is done because:
-//
-//      1.  We only want the services of these DLLs when we are
-//          actually configuring the device.
-//      2.  If any application that uses MSVCRT.DLL and this PnP driver
-//          will cause MSVCRT.DLL to fault when SETUPAPI.DLL, which
-//          also uses MSVCRT.DLL, initializes itself unless these
-//          APIs are dynamically linked.
-//
-//  Parameters:
-//
-//  Return Value:
-//      TRUE if successful, otherwise FALSE
-//
-//------------------------------------------------------------------------
-BOOL DynalinkSetupAPI()
-{
-
-    hInstSetupAPI = LoadLibrary (TEXT("SETUPAPI.DLL"));
-    if (!hInstSetupAPI)
-        return FALSE;
-
-    DLSetupDiRemoveDevice             = GetProcAddress (hInstSetupAPI, "SetupDiRemoveDevice");
-    DLSetupDiDestroyDeviceInfoList    = GetProcAddress (hInstSetupAPI, "SetupDiDestroyDeviceInfoList");
-    DLSetupDiGetDeviceInstallParams   = GetProcAddress (hInstSetupAPI, "SetupDiGetDeviceInstallParamsW");
-    DLSetupDiSetDeviceInstallParams   = GetProcAddress (hInstSetupAPI, "SetupDiSetDeviceInstallParamsW");
-    DLSetupDiGetDeviceInstanceId      = GetProcAddress (hInstSetupAPI, "SetupDiGetDeviceInstanceIdW");
-    DLSetupDiGetDeviceRegistryProperty= GetProcAddress (hInstSetupAPI, "SetupDiGetDeviceRegistryPropertyW");
-    DLSetupDiSetDeviceRegistryProperty= GetProcAddress (hInstSetupAPI, "SetupDiSetDeviceRegistryPropertyW");
-    DLSetupDiGetSelectedDriver        = GetProcAddress (hInstSetupAPI, "SetupDiGetSelectedDriverW");
-    DLSetupDiDeleteDevRegKey          = GetProcAddress (hInstSetupAPI, "SetupDiDeleteDevRegKey");
-    DLSetupDiCreateDeviceInfoList     = GetProcAddress (hInstSetupAPI, "SetupDiCreateDeviceInfoList");
-    DLSetupDiOpenDeviceInfo           = GetProcAddress (hInstSetupAPI, "SetupDiOpenDeviceInfoW");
-
-    hInstCfgMgr = LoadLibrary (TEXT("CFGMGR32.DLL"));
-    if (!hInstCfgMgr)
-    {
-        FreeLibrary(hInstSetupAPI);
-        return FALSE;
-    }
-
-    DLCM_Get_First_Log_Conf  = GetProcAddress (hInstCfgMgr, "CM_Get_First_Log_Conf");
-    DLCM_Free_Log_Conf_Handle= GetProcAddress (hInstCfgMgr, "CM_Free_Log_Conf_Handle");
-    DLCM_Get_Next_Res_Des    = GetProcAddress (hInstCfgMgr, "CM_Get_Next_Res_Des");
-    DLCM_Get_Res_Des_Data    = GetProcAddress (hInstCfgMgr, "CM_Get_Res_Des_Data");
-    DLCM_Free_Res_Des_Handle = GetProcAddress (hInstCfgMgr, "CM_Free_Res_Des_Handle");
-
-    if (DLSetupDiRemoveDevice             &&
-        DLSetupDiDestroyDeviceInfoList    &&
-        DLSetupDiGetDeviceInstallParams   &&
-        DLSetupDiSetDeviceInstallParams   &&
-        DLSetupDiGetDeviceInstanceId      &&
-        DLSetupDiGetDeviceRegistryProperty&&
-        DLSetupDiSetDeviceRegistryProperty&&
-        DLSetupDiGetSelectedDriver        &&
-        DLSetupDiDeleteDevRegKey          &&
-        DLSetupDiCreateDeviceInfoList     &&
-        DLSetupDiOpenDeviceInfo           &&
-        DLCM_Get_First_Log_Conf           &&
-        DLCM_Free_Log_Conf_Handle         &&
-        DLCM_Get_Next_Res_Des             &&
-        DLCM_Get_Res_Des_Data             &&
-        DLCM_Free_Res_Des_Handle)
-    {
-        return TRUE;
-    }
-    else
-    {
-        FreeLibrary(hInstSetupAPI);
-        FreeLibrary(hInstCfgMgr);
-    }
-
-    return FALSE;
-}
-
-//------------------------------------------------------------------------
-//  BOOL UnlinkSetupAPI
-//
-//  Description:
-//      clear out our function pointers and free setupapi and cfgmgr32
-//      libraries.
-//
-//  Parameters:
-//
-//  Return Value:
-//      TRUE if successful, otherwise FALSE
-//
-//------------------------------------------------------------------------
-BOOL UnlinkSetupAPI()
-{
-
-    DLSetupDiRemoveDevice               = NULL;
-    DLSetupDiDestroyDeviceInfoList      = NULL; 
-    DLSetupDiGetDeviceInstallParams     = NULL;    
-    DLSetupDiSetDeviceInstallParams     = NULL;   
-    DLSetupDiGetDeviceInstanceId        = NULL;
-    DLSetupDiGetDeviceRegistryProperty  = NULL; 
-    DLSetupDiSetDeviceRegistryProperty  = NULL; 
-    DLSetupDiGetSelectedDriver          = NULL; 
-    DLSetupDiDeleteDevRegKey            = NULL;        
-    DLSetupDiCreateDeviceInfoList       = NULL; 
-    DLSetupDiOpenDeviceInfo             = NULL; 
-    DLCM_Get_First_Log_Conf             = NULL; 
-    DLCM_Free_Log_Conf_Handle           = NULL; 
-    DLCM_Get_Next_Res_Des               = NULL; 
-    DLCM_Get_Res_Des_Data               = NULL; 
-    DLCM_Free_Res_Des_Handle            = NULL; 
-
-    FreeLibrary(hInstSetupAPI);
-    FreeLibrary(hInstCfgMgr);
-
-    return TRUE;
-}
 
 
 /************************************ END ***********************************/

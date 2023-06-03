@@ -1,9 +1,9 @@
 /*****************************************************************************
- * adapter.cpp - SB16 adapter driver implementation.
+ * adapter.cpp - Reconstruction of ESS adapter driver implementation.
  *****************************************************************************
- * Copyright (c) 1997-2000 Microsoft Corporation.  All rights reserved.
+ * Copyright (c) 2023 leecher@dose.0wnz.at  All rights reserved.
  *
- * This files does setup and resource allocation/verification for the SB16
+ * This files does setup and resource allocation/verification for the ESS
  * card. It controls which miniports are started and which resources are
  * given to each miniport. It also deals with interrupt sharing between
  * miniports by hooking the interrupt and calling the correct DPC.
@@ -14,12 +14,12 @@
 //
 #define PUT_GUIDS_HERE
 
-#define STR_MODULENAME "sb16Adapter: "
+#define STR_MODULENAME "es1969Adapter: "
 
 #include "common.h"
-
-
-
+#include "minwave.h"
+#include "minfm.h"
+#include "minuart.h"
 
 
 /*****************************************************************************
@@ -33,15 +33,57 @@
 #define SUCCEEDS(s) (s)
 #endif
 
+DEFINE_GUID(CLSID_MiniportDriverESFMSynth,
+0x7EAEB839, 0xFF5F, 0x11D0, 0xA5, 0x10, 0x00, 0x60, 0x97, 0xC7, 0x9D, 0x21);
+
+DEFINE_GUID(CLSID_MiniportDriverUartESS,
+0xF6A7ED80, 0xE68E, 0x11D1, 0x9B, 0x4B, 0x00, 0xC0, 0x9F, 0x00, 0x3C, 0x24);
 
 
+struct DEVICE_CONTEXT
+{
+  DEVICE_RELATIONS DeviceRelation;
+  ULONG InterruptVector;
+  DWORD IOPort;
+  CMiniportWaveSolo *MiniportWaveCyclic;
+  CMiniportMidiFM *MiniportMidiESFM;
+  CMiniportMidiUart *MiniportMidiUartESS;
+  struct _DEVICE_CONTEXT *ParentContext;
+};
+typedef struct DEVICE_CONTEXT *PDEVICE_CONTEXT;
+
+typedef struct DEVICE_EXTENSION
+{
+  ULONG_PTR gap1[4];
+  DWORD Cookie1;
+  DWORD Cookie2;
+  PDEVICE_OBJECT PhysicalDeviceObject;
+  PVOID DeviceContext;
+  DWORD DeviceNumber;
+  ULONG_PTR gap2[2];
+  DWORD JoystickPort;
+  DWORD JoystickIRQ;
+  ULONG_PTR gap3[11];
+  PDEVICE_OBJECT DeviceObject;
+  POWER_STATE SystemState;
+  POWER_STATE DeviceState;
+} *PDEVICE_EXTENSION;
+
+
+/*****************************************************************************
+ * Globals
+ */
+WORD gwPDO_Count = 0;
+BOOL NoJoy = FALSE;
+PDEVICE_CONTEXT ParentDeviceContext = NULL;
+static GUID GUID_Solo1Bus = {0x7E274041, 0x0C960, 0x11D1, 0xA6, 0x2F, 0x00, 0xC0, 0x9F, 0x00, 0x2B, 0x8F};
 
 
 /*****************************************************************************
  * Externals
  */
 NTSTATUS
-CreateMiniportWaveCyclicSB16
+CreateMiniportWaveSolo
 (
     OUT     PUNKNOWN *  Unknown,
     IN      REFCLSID,
@@ -49,7 +91,7 @@ CreateMiniportWaveCyclicSB16
     IN      POOL_TYPE   PoolType
 );
 NTSTATUS
-CreateMiniportTopologySB16
+CreateMiniportTopologyESS
 (
     OUT     PUNKNOWN *  Unknown,
     IN      REFCLSID,
@@ -72,6 +114,13 @@ AddDevice
     IN PDEVICE_OBJECT   PhysicalDeviceObject
 );
 
+extern "C"
+VOID
+Unload
+(
+    IN PDRIVER_OBJECT   DriverObject
+);
+
 NTSTATUS
 StartDevice
 (
@@ -84,14 +133,21 @@ NTSTATUS
 AssignResources
 (
     IN  PRESOURCELIST   ResourceList,           // All resources.
-    OUT PRESOURCELIST * ResourceListWave,       // Wave resources.
-    OUT PRESOURCELIST * ResourceListWaveTable,  // Wave table resources.
+    OUT PRESOURCELIST * ResourceListTopology,   // Topology resources.
+    OUT PRESOURCELIST * ResourceListWave,       // Wave  resources.
     OUT PRESOURCELIST * ResourceListFmSynth,    // FM synth resources.
     OUT PRESOURCELIST * ResourceListUart,       // UART resources.
     OUT PRESOURCELIST * ResourceListAdapter     // a copy needed by the adapter
 );
 
-#ifdef DO_RESOURCE_FILTERING
+extern "C"
+NTSTATUS
+AdapterGlobalIrpDispatch
+(
+    IN      PDEVICE_OBJECT  pDeviceObject,
+    IN      PIRP            pIrp
+);
+
 extern "C"
 NTSTATUS
 AdapterDispatchPnp
@@ -99,12 +155,511 @@ AdapterDispatchPnp
     IN      PDEVICE_OBJECT  pDeviceObject,
     IN      PIRP            pIrp
 );
-#endif
+
+extern "C"
+NTSTATUS
+ChildPdoPower
+(
+    IN      PDEVICE_OBJECT     pDeviceObject,
+    IN      PIRP               pIrp,
+    IN      PIO_STACK_LOCATION pIrpStack,
+    IN      PDEVICE_EXTENSION  pDeviceExtension
+);
+
+extern "C"
+NTSTATUS
+ChildPdoPnp
+(
+    IN      PDEVICE_OBJECT     pDeviceObject,
+    IN      PIRP               pIrp,
+    IN      PIO_STACK_LOCATION pIrpStack,
+    IN      PDEVICE_EXTENSION  pDeviceExtension
+);
 
 DWORD DeterminePlatform(PPORTTOPOLOGY Port);
 
 
-#pragma code_seg("INIT")
+
+#define ESSM_COOKIE         0x33E811D3
+#define COOKIE_SOUNDCARD    0xA067AA5C
+#define COOKIE_JOYSTICK     0xAE350760
+
+#pragma code_seg("PAGE")
+
+
+/*****************************************************************************
+ * RemoveParentDeviceContext()
+ *****************************************************************************
+ * Free DeviceContext from DeviceObject 
+ */
+VOID RemoveParentDeviceContext(PDEVICE_OBJECT pDeviceObject)
+{
+    PDEVICE_EXTENSION pDeviceExtension;
+    
+    PAGED_CODE();
+    
+    pDeviceExtension = (PDEVICE_EXTENSION)pDeviceObject->DeviceExtension;
+    if ( pDeviceExtension->DeviceContext )
+    {
+        ExFreePool(pDeviceExtension->DeviceContext);
+        pDeviceExtension->DeviceContext = NULL;
+    }
+}
+
+static BOOL ReturnDupString
+(
+    IN      PIRP               pIrp,
+    IN      PWCHAR             String
+)
+{
+    PVOID Text;
+    size_t Length;
+    
+    Length = (wcslen(String) + 2) * sizeof(WCHAR);
+    if ((Text = ExAllocatePool(PagedPool, Length)) == NULL)
+        return FALSE;
+    RtlZeroMemory(Text, Length);
+    RtlCopyMemory(Text, String, Length - sizeof(WCHAR));
+    pIrp->IoStatus.Information = (ULONG_PTR)Text;
+    return TRUE;
+}
+
+
+
+/*****************************************************************************
+ * AdapterDispatchPnp()
+ *****************************************************************************
+ * Supplying your PnP resource filtering needs.
+ */
+extern "C"
+NTSTATUS
+AdapterDispatchPnp
+(
+    IN      PDEVICE_OBJECT  pDeviceObject,
+    IN      PIRP            pIrp
+)
+{
+    PAGED_CODE();
+
+    ASSERT(pDeviceObject);
+    ASSERT(pIrp);
+
+    PDEVICE_CONTEXT pDeviceContext;
+    PDEVICE_OBJECT pDeviceObjectNew;
+    CM_PARTIAL_RESOURCE_LIST *pPartialResourceList;
+    unsigned int i;
+
+    PIO_STACK_LOCATION pIrpStack =
+        IoGetCurrentIrpStackLocation(pIrp);
+
+    switch( pIrpStack->MinorFunction )
+    {
+        case IRP_MN_REMOVE_DEVICE:
+        case IRP_MN_STOP_DEVICE:
+            pDeviceContext = (PDEVICE_CONTEXT)((PDEVICE_EXTENSION)pDeviceObject->DeviceExtension)->DeviceContext;
+            if ( pDeviceContext )
+            {
+                if ( pDeviceContext->MiniportWaveCyclic )
+                {
+                    pDeviceContext->MiniportWaveCyclic->Release();
+                    pDeviceContext->MiniportWaveCyclic = NULL;
+                }
+                if ( pDeviceContext->MiniportMidiESFM )
+                {
+                    pDeviceContext->MiniportMidiESFM->Release();
+                    pDeviceContext->MiniportMidiESFM = NULL;
+                }
+                if ( pDeviceContext->MiniportMidiUartESS )
+                {
+                    pDeviceContext->MiniportMidiUartESS->Release();
+                    pDeviceContext->MiniportMidiUartESS = NULL;
+                }
+                
+                if ( pIrpStack->MinorFunction == IRP_MN_REMOVE_DEVICE )
+                {
+                    for ( i = 0; i < gwPDO_Count; i++ )
+                    {
+                        if ( pDeviceContext->DeviceRelation.Objects[i] && i < pDeviceContext->DeviceRelation.Count)
+                        {
+                            ObDereferenceObject(pDeviceContext->DeviceRelation.Objects[i]);
+                            ZwMakeTemporaryObject(pDeviceContext->DeviceRelation.Objects[i]);
+                            ZwClose(pDeviceContext->DeviceRelation.Objects[i]);
+                            IoDeleteDevice(pDeviceContext->DeviceRelation.Objects[i]);
+                            pDeviceContext->DeviceRelation.Objects[i] = NULL;
+                        }
+                    }
+                    RemoveParentDeviceContext(pDeviceObject);
+                }
+            }
+            break;
+        
+        case IRP_MN_QUERY_DEVICE_RELATIONS:
+            if ( pIrpStack->Parameters.QueryDeviceRelations.Type == BusRelations )
+            {
+                DWORD RelationsSize;
+                PDEVICE_RELATIONS pDeviceRelations;
+                PDEVICE_EXTENSION pDeviceExtension;
+                
+                gwPDO_Count = NoJoy == FALSE;
+                pDeviceContext = (PDEVICE_CONTEXT)((PDEVICE_EXTENSION)pDeviceObject->DeviceExtension)->DeviceContext;
+                
+                if ( pDeviceContext ) 
+                {
+                    RelationsSize = sizeof(DEVICE_RELATIONS) + (gwPDO_Count * sizeof(PDEVICE_OBJECT));
+                    pDeviceRelations = (PDEVICE_RELATIONS)ExAllocatePool(PagedPool, RelationsSize);
+                    
+                    if (!pDeviceRelations)
+                    {
+                        pIrp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+                        IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+                        return STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                    RtlZeroMemory(pDeviceRelations, RelationsSize);
+                    for ( i = 0; i < gwPDO_Count; i++ )
+                    {
+                        if ( i || !NoJoy )
+                        {
+                            // NB: i < pDeviceContext->DeviceRelation.Count not in orig code, added for safety
+                            if ( pDeviceContext->DeviceRelation.Objects[i] && i < pDeviceContext->DeviceRelation.Count)
+                            {
+                                pDeviceRelations->Objects[pDeviceRelations->Count++] = pDeviceContext->DeviceRelation.Objects[i];
+                                ObReferenceObject( pDeviceContext->DeviceRelation.Objects[i] );
+                                pDeviceExtension = (PDEVICE_EXTENSION)pDeviceContext->DeviceRelation.Objects[i]->DeviceExtension;
+                                pDeviceExtension->DeviceNumber = i;
+                                pDeviceExtension->DeviceObject = pDeviceObject;
+                            }
+                            else if ( NT_SUCCESS(IoCreateDevice(pDeviceObject->DriverObject, sizeof(DEVICE_EXTENSION), 
+                                      NULL, FILE_DEVICE_UNKNOWN, FILE_AUTOGENERATED_DEVICE_NAME, FALSE, &pDeviceObjectNew)) )
+                            {
+                                pDeviceRelations->Objects[pDeviceRelations->Count++] = pDeviceObjectNew;
+                                ObReferenceObject(pDeviceObjectNew);
+                                pDeviceExtension = (PDEVICE_EXTENSION)pDeviceObjectNew->DeviceExtension;
+                                pDeviceExtension->DeviceContext = NULL;
+                                pDeviceExtension->PhysicalDeviceObject = pDeviceObjectNew;
+                                pDeviceExtension->Cookie1 = ESSM_COOKIE;;
+                                pDeviceExtension->Cookie2 = COOKIE_JOYSTICK;
+                                pDeviceExtension->DeviceNumber = i;
+                                pDeviceExtension->DeviceObject = pDeviceObject;
+                                pDeviceObjectNew->Flags |= DO_POWER_PAGABLE | DO_DIRECT_IO;
+                            }
+                        }
+                    }
+                    if ( pIrp->IoStatus.Information )
+                        ExFreePool((PVOID)pIrp->IoStatus.Information);
+                    pIrp->IoStatus.Status = STATUS_SUCCESS;
+                    pIrp->IoStatus.Information = (ULONG_PTR)pDeviceRelations;
+                }
+            }
+            break;
+        case IRP_MN_START_DEVICE:
+            pDeviceContext = (PDEVICE_CONTEXT)((PDEVICE_EXTENSION)pDeviceObject->DeviceExtension)->DeviceContext;
+            if ( !pDeviceContext )
+            {
+                pIrp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+                IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+                return STATUS_INSUFFICIENT_RESOURCES;               
+            }
+            ParentDeviceContext = pDeviceContext;
+            pDeviceContext->IOPort = 0;
+            pDeviceObjectNew = NULL;
+            pPartialResourceList = &pIrpStack->Parameters.StartDevice.AllocatedResources->List[0].PartialResourceList;
+            for ( i = 0; i < pPartialResourceList->Count; i++ )
+            {
+                switch ( pPartialResourceList->PartialDescriptors[i].Type )
+                {
+                    case CmResourceTypePort:
+                        if ( !pDeviceContext->IOPort )
+                            pDeviceContext->IOPort = pIrpStack->Parameters.StartDevice.AllocatedResourcesTranslated->List[0].PartialResourceList.PartialDescriptors[i].u.Port.Start.LowPart;
+                        break;
+                    case CmResourceTypeInterrupt:
+                        pDeviceContext->InterruptVector = pPartialResourceList->PartialDescriptors[i].u.Interrupt.Vector;
+                        break;
+                }
+            }
+            break;
+    }
+
+    //
+    // Pass the IRPs on to PortCls
+    //
+    return PcDispatchIrp( pDeviceObject,
+                              pIrp );
+}
+
+
+/*****************************************************************************
+ * ChildPdoPnp()
+ *****************************************************************************
+ * PNP Dispatcher
+ */
+extern "C"
+NTSTATUS
+ChildPdoPnp
+(
+    IN      PDEVICE_OBJECT     pDeviceObject,
+    IN      PIRP               pIrp,
+    IN      PIO_STACK_LOCATION pIrpStack,
+    IN      PDEVICE_EXTENSION  pDeviceExtension
+)
+{
+    PAGED_CODE();
+
+    ASSERT(pDeviceObject);
+    ASSERT(pIrp);
+    ASSERT(pIrpStack);
+
+    NTSTATUS Status = pIrp->IoStatus.Status;
+    PCM_PARTIAL_RESOURCE_LIST pPartialResourceList;
+    PDEVICE_CAPABILITIES Capabilities;
+    PIO_RESOURCE_REQUIREMENTS_LIST NewRequirements;
+    PPNP_BUS_INFORMATION BusInformation;
+    DWORD PortData, PortData2;
+    PDEVICE_RELATIONS pDeviceRelations;
+    unsigned int i;
+    
+    _DbgPrintF(DEBUGLVL_TERSE, ("ChildPdoPnp() %x", pIrpStack->MinorFunction));
+    
+    switch( pIrpStack->MinorFunction )
+    {
+        case IRP_MN_QUERY_DEVICE_RELATIONS:
+            if ( pIrpStack->Parameters.QueryDeviceRelations.Type == TargetDeviceRelation )
+            {
+                pDeviceRelations = (PDEVICE_RELATIONS)ExAllocatePool(NonPagedPool, sizeof(DEVICE_RELATIONS) + sizeof(PDEVICE_OBJECT) /* why? */);
+                if ( !pDeviceRelations )
+                  return STATUS_INSUFFICIENT_RESOURCES;
+                pDeviceRelations->Count = 1;
+                pDeviceRelations->Objects[0] = pDeviceObject;
+                ObfReferenceObject(pDeviceObject);
+                if ( pIrp->IoStatus.Information )
+                    ExFreePool((PVOID)pIrp->IoStatus.Information);
+                pIrp->IoStatus.Information = (ULONG_PTR)pDeviceRelations;
+                Status = STATUS_SUCCESS;
+            }
+            break;
+        case IRP_MN_QUERY_REMOVE_DEVICE:
+        case IRP_MN_REMOVE_DEVICE:
+        case IRP_MN_CANCEL_REMOVE_DEVICE:
+        case IRP_MN_QUERY_STOP_DEVICE:
+        case IRP_MN_CANCEL_STOP_DEVICE:
+            Status = STATUS_SUCCESS;
+            break;
+        case IRP_MN_STOP_DEVICE:
+            if ( pDeviceExtension->DeviceNumber == 0 )
+            {
+                AccessConfigSpace(pDeviceExtension->DeviceObject, FALSE, &pDeviceExtension->JoystickIRQ, 0x20, sizeof(pDeviceExtension->JoystickIRQ));
+                Status = STATUS_SUCCESS;
+            }
+            break;
+        case IRP_MN_START_DEVICE:
+            pDeviceExtension->DeviceState.SystemState = PowerSystemWorking;
+            if ( pDeviceExtension->DeviceNumber == 0 )
+            {
+                pPartialResourceList = &pIrpStack->Parameters.StartDevice.AllocatedResourcesTranslated->List[0].PartialResourceList;
+                for ( i = 0; i < pIrpStack->Parameters.StartDevice.AllocatedResources->List[0].PartialResourceList.Count; i++ )
+                {
+                    switch ( pIrpStack->Parameters.StartDevice.AllocatedResources->List[0].PartialResourceList.PartialDescriptors->Type )
+                    {
+                        case CmResourceTypePort:
+                            pDeviceExtension->JoystickPort = pPartialResourceList->PartialDescriptors[i].u.Port.Start.LowPart;
+                            break;
+                    }
+                }
+            }
+            if ( pDeviceExtension->JoystickPort == 0x201 ) // Joystick port
+            {
+ConfigJoyPort:
+                AccessConfigSpace(pDeviceExtension->DeviceObject, TRUE,  &PortData, ESM_LEGACY_AUDIO_CONTROL, sizeof(PortData));
+                PortData |= 4;
+                AccessConfigSpace(pDeviceExtension->DeviceObject, FALSE, &PortData, ESM_LEGACY_AUDIO_CONTROL, sizeof(PortData));
+                AccessConfigSpace(pDeviceExtension->DeviceObject, TRUE,  &PortData, ESM_GAMEPORT, sizeof(PortData));
+                pDeviceExtension->JoystickIRQ = PortData;
+                PortData = 0x201;
+                AccessConfigSpace(pDeviceExtension->DeviceObject, FALSE, &PortData, ESM_GAMEPORT, sizeof(PortData));
+            }
+            Status = STATUS_SUCCESS;
+            break;
+            
+        case IRP_MN_QUERY_CAPABILITIES:
+            Capabilities = pIrpStack->Parameters.DeviceCapabilities.Capabilities;
+            Capabilities->LockSupported = FALSE;
+            Capabilities->EjectSupported = FALSE;
+            Capabilities->Removable = FALSE;
+            Capabilities->DockDevice = FALSE;
+            Capabilities->UniqueID = FALSE;
+            Capabilities->SilentInstall = FALSE;
+            Capabilities->RawDeviceOK = FALSE;
+            Capabilities->SurpriseRemovalOK = FALSE;
+            Capabilities->DeviceState[0] = PowerDeviceD3;
+            Capabilities->DeviceState[1] = PowerDeviceD0;
+            Capabilities->DeviceState[2] = PowerDeviceD1;
+            Capabilities->DeviceState[3] = PowerDeviceD2;
+            Capabilities->DeviceState[4] = PowerDeviceD3;
+            Capabilities->DeviceState[5] = PowerDeviceD3;
+            Capabilities->DeviceState[6] = PowerDeviceD3;
+            Capabilities->SystemWake = PowerSystemUnspecified;
+            Capabilities->DeviceWake = PowerDeviceUnspecified;
+            Capabilities->D1Latency = 0;
+            Capabilities->D2Latency = 0;
+            Capabilities->D3Latency = 0;
+            Status = STATUS_SUCCESS;
+            break;
+            
+        case IRP_MN_QUERY_RESOURCE_REQUIREMENTS:
+            if ( pDeviceExtension->DeviceNumber == 0 )
+            {
+                NewRequirements = (PIO_RESOURCE_REQUIREMENTS_LIST)ExAllocatePool(PagedPool, sizeof(IO_RESOURCE_REQUIREMENTS_LIST));
+                if ( NewRequirements )
+                {
+                    RtlZeroMemory(NewRequirements, sizeof(IO_RESOURCE_REQUIREMENTS_LIST));
+                    NewRequirements->ListSize = sizeof(IO_RESOURCE_REQUIREMENTS_LIST);
+                    NewRequirements->AlternativeLists = 1;
+                    NewRequirements->List[0].Descriptors[0].Option = 0;
+                    NewRequirements->List[0].Descriptors[0].ShareDisposition = CmResourceShareUndetermined;
+                    NewRequirements->List[0].Descriptors[0].u.Port.MinimumAddress.HighPart = 0;
+                    NewRequirements->List[0].Descriptors[0].u.Port.MaximumAddress.HighPart = 0;
+                    NewRequirements->List[0].Descriptors[0].u.Port.MinimumAddress.LowPart = 0x201;
+                    NewRequirements->List[0].Descriptors[0].u.Port.MaximumAddress.LowPart = 0x201;
+                    NewRequirements->List[0].Version = 1;
+                    NewRequirements->List[0].Revision = 1;
+                    NewRequirements->List[0].Count = 1;
+                    NewRequirements->List[0].Descriptors[0].Type = CmResourceTypePort;
+                    NewRequirements->List[0].Descriptors[0].Flags = CM_RESOURCE_PORT_IO | CM_RESOURCE_PORT_16_BIT_DECODE;
+                    NewRequirements->List[0].Descriptors[0].u.Port.Length = 1;
+                    NewRequirements->List[0].Descriptors[0].u.Port.Alignment = 1;
+                    pDeviceExtension->JoystickPort = 0x201;
+                    pIrp->IoStatus.Information = (ULONG_PTR)NewRequirements;
+                    goto ConfigJoyPort;
+                }
+            }
+            break;
+        case IRP_MN_QUERY_DEVICE_TEXT:
+            if ( pIrpStack->Parameters.Read.Length || pDeviceExtension->DeviceNumber > 0 || 
+                 !ReturnDupString(pIrp,  L"ESS ES1969 Gameport Joystick") ) break;
+            Status = STATUS_SUCCESS;
+            break;
+        case IRP_MN_QUERY_ID:
+            switch ( pIrpStack->Parameters.QueryId.IdType )
+            {
+                case BusQueryCompatibleIDs:
+                    if ( pDeviceExtension->DeviceNumber > 0 || 
+                         !ReturnDupString(pIrp,  L"*PNPB02F") ) break;
+                    Status = STATUS_SUCCESS;
+                    break;
+                case BusQueryInstanceID:
+                    if ( !ReturnDupString(pIrp,  L"00000000") ) break;
+                    Status = STATUS_SUCCESS;
+                    break;
+                case BusQueryHardwareIDs:
+                    if ( pDeviceExtension->DeviceNumber > 0 || 
+                         !ReturnDupString(pIrp,  L"ES1969_GAMEPORT") ) break;
+                    Status = STATUS_SUCCESS;
+                    break;
+                case BusQueryDeviceID:
+                    if ( pDeviceExtension->DeviceNumber > 0 || 
+                         !ReturnDupString(pIrp,  L"ESS_ES1969\\CHILD0000") ) break;
+                    Status = STATUS_SUCCESS;
+                    break;
+            }
+            break;
+        case IRP_MN_QUERY_PNP_DEVICE_STATE:
+            AccessConfigSpace(pDeviceExtension->DeviceObject, TRUE,  &PortData,  ESM_LEGACY_AUDIO_CONTROL, sizeof(PortData));
+            PortData2 = PortData & (~0x8000);
+            AccessConfigSpace(pDeviceExtension->DeviceObject, FALSE, &PortData2, ESM_LEGACY_AUDIO_CONTROL, sizeof(PortData2));
+            pIrp->IoStatus.Information = READ_PORT_UCHAR((PUCHAR)((ULONG_PTR)pDeviceExtension->JoystickPort)) == 0xFF ? PNP_DEVICE_FAILED : 0;
+            AccessConfigSpace(pDeviceExtension->DeviceObject, FALSE, &PortData,  ESM_LEGACY_AUDIO_CONTROL, sizeof(PortData));
+            Status = STATUS_SUCCESS;
+            break;
+        case IRP_MN_QUERY_BUS_INFORMATION:
+            if ((BusInformation = (PPNP_BUS_INFORMATION)ExAllocatePool(PagedPool, sizeof(PNP_BUS_INFORMATION))) == NULL)
+            {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+            BusInformation->BusTypeGuid = GUID_Solo1Bus;
+            BusInformation->BusNumber = 0;
+            BusInformation->LegacyBusType = PNPBus;
+            pIrp->IoStatus.Information = (ULONG_PTR)BusInformation;
+            Status = STATUS_SUCCESS;
+            break;
+    }
+
+    pIrp->IoStatus.Status = Status;
+    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+    return Status;
+}
+
+/*****************************************************************************
+ * AdapterGlobalIrpDispatch()
+ *****************************************************************************
+ * Main dispatch routine 
+ */
+extern "C"
+NTSTATUS
+AdapterGlobalIrpDispatch
+(
+    IN      PDEVICE_OBJECT  pDeviceObject,
+    IN      PIRP            pIrp
+)
+{
+    PAGED_CODE();
+
+    ASSERT(pDeviceObject);
+    ASSERT(pIrp);
+
+    PIO_STACK_LOCATION pIrpStack =
+        IoGetCurrentIrpStackLocation(pIrp);
+    PDEVICE_EXTENSION pDeviceExtension = (PDEVICE_EXTENSION)pDeviceObject->DeviceExtension;
+
+    if (pDeviceExtension->Cookie1 == ESSM_COOKIE && pDeviceExtension->Cookie2 == COOKIE_JOYSTICK)
+    {
+        switch ( pIrpStack->MajorFunction )
+        {
+            case IRP_MJ_POWER:
+                return ChildPdoPower(pDeviceObject, pIrp, pIrpStack, pDeviceExtension);
+
+            default:
+                pIrp->IoStatus.Status = STATUS_SUCCESS;
+
+            case IRP_MJ_SYSTEM_CONTROL:
+                IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+                return pIrp->IoStatus.Status;
+                
+            case IRP_MJ_PNP:
+                return ChildPdoPnp(pDeviceObject, pIrp, pIrpStack, pDeviceExtension);
+        }
+    }
+    else if (pDeviceExtension->Cookie1 == ESSM_COOKIE && 
+             pDeviceExtension->Cookie2 == COOKIE_SOUNDCARD && 
+             pIrpStack->MajorFunction == IRP_MJ_PNP)
+    {
+        return AdapterDispatchPnp(pDeviceObject, pIrp);
+    }
+
+    //
+    // Pass the IRPs on to PortCls
+    //
+    return PcDispatchIrp( pDeviceObject,
+                              pIrp );
+}
+
+
+/*****************************************************************************
+ * Unload()
+ *****************************************************************************
+ * This function is called by the operating system when the device is unloaded.
+ */
+extern "C"
+VOID
+Unload
+(
+    IN PDRIVER_OBJECT   DriverObject
+)
+{
+    PAGED_CODE();
+
+    UNREFERENCED_PARAMETER(DriverObject);
+}
+
 
 /*****************************************************************************
  * DriverEntry()
@@ -120,34 +675,83 @@ DriverEntry
     IN PUNICODE_STRING  RegistryPathName
 )
 {
+    UNREFERENCED_PARAMETER(RegistryPathName);
+
     PAGED_CODE();
 
-    //
-    // Tell the class driver to initialize the driver.
-    //
-    NTSTATUS ntStatus = PcInitializeAdapterDriver( DriverObject,
-                                                   RegistryPathName,
-                                                   AddDevice );
-
-#ifdef DO_RESOURCE_FILTERING
-    //
-    // We want to do resource filtering, so we'll install our own PnP IRP handler.
-    //
-    if(NT_SUCCESS(ntStatus))
-    {
-        DriverObject->MajorFunction[IRP_MJ_PNP] = AdapterDispatchPnp;
-    }
-#endif
-
-    return ntStatus;
+    int i;
+    
+    for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
+        DriverObject->MajorFunction[i] = AdapterGlobalIrpDispatch;
+    
+    DriverObject->DriverExtension->AddDevice = AddDevice;
+    DriverObject->DriverUnload = Unload;
+    
+    //return STATUS_UNSUCCESSFUL;
+    return STATUS_SUCCESS;    
 }
 
-#pragma code_seg("PAGE")
+
+/*****************************************************************************
+ * ChildPdoPower()
+ *****************************************************************************
+ * PDO Power
+ */
+extern "C"
+NTSTATUS
+ChildPdoPower
+(
+    IN      PDEVICE_OBJECT     pDeviceObject,
+    IN      PIRP               pIrp,
+    IN      PIO_STACK_LOCATION pIrpStack,
+    IN      PDEVICE_EXTENSION  pDeviceExtension
+)
+{
+    PAGED_CODE();
+
+    ASSERT(pDeviceObject);
+    ASSERT(pIrp);
+    ASSERT(pIrpStack);
+
+    NTSTATUS Status = pIrp->IoStatus.Status;
+    
+    switch( pIrpStack->MinorFunction )
+    {
+        case IRP_MN_REMOVE_DEVICE:
+        {
+            POWER_STATE DeviceState, SystemState;
+            
+            DeviceState.SystemState = pIrpStack->Parameters.Power.State.SystemState;
+            if ( pIrpStack->Parameters.Power.Type )
+            {
+                if ( pIrpStack->Parameters.Power.Type != DevicePowerState ) break;
+                PoSetPowerState(pDeviceObject, DevicePowerState, DeviceState);
+                pDeviceExtension->DeviceState = DeviceState;
+            }
+            else
+            {
+                SystemState.SystemState = PowerSystemWorking;
+                if ( DeviceState.SystemState != PowerSystemWorking )
+                    SystemState.SystemState = PowerSystemSleeping3;
+                PoRequestPowerIrp(pDeviceObject, IRP_MN_REMOVE_DEVICE, SystemState, NULL, NULL, NULL);
+                pDeviceExtension->SystemState = SystemState;
+            }
+        }
+        case IRP_MN_CANCEL_REMOVE_DEVICE:
+            Status = STATUS_SUCCESS;
+            break;
+    }
+    PoStartNextPowerIrp(pIrp);
+    pIrp->IoStatus.Status = Status;
+    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+    return Status;
+}
+
+
 /*****************************************************************************
  * AddDevice()
  *****************************************************************************
  * This function is called by the operating system when the device is added.
- * All adapter drivers can use this code without change.
  */
 extern "C"
 NTSTATUS
@@ -162,12 +766,35 @@ AddDevice
     //
     // Tell the class driver to add the device.
     //
-    return PcAddAdapterDevice( DriverObject,
-                               PhysicalDeviceObject,
-                               PCPFNSTARTDEVICE( StartDevice ),
-                               MAX_MINIPORTS,
-                               0 );
+    NTSTATUS ntStatus = PcAddAdapterDevice( DriverObject,
+                                            PhysicalDeviceObject,
+                                            PCPFNSTARTDEVICE( StartDevice ),
+                                            MAX_MINIPORTS,
+                                            0 );
+
+    if(NT_SUCCESS(ntStatus))
+    {
+        PDEVICE_OBJECT pDeviceObject;
+        PDEVICE_EXTENSION pDeviceExtension;
+        PDEVICE_CONTEXT DeviceContext = (PDEVICE_CONTEXT)ExAllocatePool(PagedPool, sizeof(DEVICE_CONTEXT));
+        
+
+        if (!DeviceContext) return STATUS_INSUFFICIENT_RESOURCES;
+        RtlZeroMemory(DeviceContext, sizeof(DeviceContext));
+        
+        pDeviceObject = IoGetAttachedDeviceReference(PhysicalDeviceObject);
+        pDeviceExtension = (PDEVICE_EXTENSION)pDeviceObject->DeviceExtension;
+        pDeviceExtension->Cookie1 = ESSM_COOKIE;
+        pDeviceExtension->Cookie2 = COOKIE_SOUNDCARD;
+        pDeviceExtension->PhysicalDeviceObject = PhysicalDeviceObject;
+        pDeviceExtension->DeviceContext = DeviceContext;
+        ObfDereferenceObject(pDeviceObject);
+    }
+
+    return ntStatus;   
 }
+
+
 
 /*****************************************************************************
  * InstallSubdevice()
@@ -192,15 +819,16 @@ InstallSubdevice
     IN      PRESOURCELIST       ResourceList,
     IN      REFGUID             PortInterfaceId,
     OUT     PUNKNOWN *          OutPortInterface    OPTIONAL,
-    OUT     PUNKNOWN *          OutPortUnknown      OPTIONAL
+    OUT     PUNKNOWN *          OutPortUnknown      OPTIONAL,
+    OUT     PUNKNOWN *          OutMiniportUnknown  OPTIONAL
 )
 {
     PAGED_CODE();
-    _DbgPrintF(DEBUGLVL_VERBOSE, ("InstallSubdevice"));
 
     ASSERT(DeviceObject);
     ASSERT(Irp);
     ASSERT(Name);
+    ASSERT(ResourceList);
 
     //
     // Create the port driver object
@@ -215,102 +843,117 @@ InstallSubdevice
         //
         if (OutPortInterface)
         {
-            //
-            //  Failure here doesn't cause the entire routine to fail.
-            //
-            (void) port->QueryInterface
+            ntStatus = port->QueryInterface
             (
                 PortInterfaceId,
                 (PVOID *) OutPortInterface
             );
         }
 
-        PUNKNOWN miniport;
-        //
-        // Create the miniport object
-        //
-        if (MiniportCreate)
-        {
-            ntStatus = MiniportCreate
-            (
-                &miniport,
-                MiniportClassId,
-                NULL,
-                NonPagedPool
-            );
-        }
-        else
-        {
-            ntStatus = PcNewMiniport((PMINIPORT*) &miniport,MiniportClassId);
-        }
-
         if (NT_SUCCESS(ntStatus))
         {
+
+            PUNKNOWN miniport;
             //
-            // Init the port driver and miniport in one go.
+            // Create the miniport object
             //
-            ntStatus = port->Init( DeviceObject,
-                                   Irp,
-                                   miniport,
-                                   UnknownAdapter,
-                                   ResourceList );
+            if (MiniportCreate)
+            {
+                ntStatus = MiniportCreate
+                (
+                    &miniport,
+                    MiniportClassId,
+                    NULL,
+                    NonPagedPool
+                );
+            }
+            else
+            {
+                ntStatus = PcNewMiniport((PMINIPORT*) &miniport,MiniportClassId);
+            }
+
+            if (NT_SUCCESS(ntStatus))
+            {              
+                //
+                // Deposit the port as an unknown if it's needed.
+                //
+                if (OutMiniportUnknown)
+                {
+                    ntStatus = miniport->QueryInterface
+                    (
+                        IID_IUnknown,
+                        (PVOID *) OutMiniportUnknown
+                    );
+                }
+
+                if (NT_SUCCESS(ntStatus))
+                {              
+                    //
+                    // Init the port driver and miniport in one go.
+                    //
+                    ntStatus = port->Init( DeviceObject,
+                                           Irp,
+                                           miniport,
+                                           UnknownAdapter,
+                                           ResourceList );
+
+                    if (NT_SUCCESS(ntStatus))
+                    {
+                        //
+                        // Register the subdevice (port/miniport combination).
+                        //
+                        ntStatus = PcRegisterSubdevice( DeviceObject,
+                                                        Name,
+                                                        port );
+                        if (!(NT_SUCCESS(ntStatus)))
+                        {
+                            _DbgPrintF(DEBUGLVL_TERSE, ("StartDevice: PcRegisterSubdevice failed"));
+                        }
+                    }
+                    else
+                    {
+                        _DbgPrintF(DEBUGLVL_TERSE, ("InstallSubdevice: port->Init failed"));
+                    }
+                }
+                
+                //
+                // We don't need the miniport any more.  Either the port has it,
+                // or we've failed, and it should be deleted.
+                //
+                miniport->Release();
+            }
+            else
+            {
+                _DbgPrintF(DEBUGLVL_TERSE, ("InstallSubdevice: PcNewMiniport failed"));
+            }
 
             if (NT_SUCCESS(ntStatus))
             {
                 //
-                // Register the subdevice (port/miniport combination).
+                // Deposit the port as an unknown if it's needed.
                 //
-                ntStatus = PcRegisterSubdevice( DeviceObject,
-                                                Name,
-                                                port );
-                if (!(NT_SUCCESS(ntStatus)))
+                if (OutPortUnknown)
                 {
-                    _DbgPrintF(DEBUGLVL_TERSE, ("StartDevice: PcRegisterSubdevice failed"));
+                    ntStatus = port->QueryInterface
+                    (
+                        IID_IUnknown,
+                        (PVOID *) OutPortUnknown
+                    );
                 }
             }
-            else
-            {
-                _DbgPrintF(DEBUGLVL_TERSE, ("InstallSubdevice: port->Init failed"));
-            }
-
-            //
-            // We don't need the miniport any more.  Either the port has it,
-            // or we've failed, and it should be deleted.
-            //
-            miniport->Release();
+            
+            port->Release();
+            
+            return ntStatus;
         }
-        else
+        
+        //
+        // Retract previously delivered port interface.
+        //
+        if (OutPortInterface && (*OutPortInterface))
         {
-            _DbgPrintF(DEBUGLVL_TERSE, ("InstallSubdevice: PcNewMiniport failed"));
-        }
-
-        if (NT_SUCCESS(ntStatus))
-        {
-            //
-            // Deposit the port as an unknown if it's needed.
-            //
-            if (OutPortUnknown)
-            {
-                //
-                //  Failure here doesn't cause the entire routine to fail.
-                //
-                (void) port->QueryInterface
-                (
-                    IID_IUnknown,
-                    (PVOID *) OutPortUnknown
-                );
-            }
-        }
-        else
-        {
-            //
-            // Retract previously delivered port interface.
-            //
-            if (OutPortInterface && (*OutPortInterface))
-            {
-                (*OutPortInterface)->Release();
-                *OutPortInterface = NULL;
-            }
+            (*OutPortInterface)->Release();
+            *OutPortInterface = NULL;
         }
 
         //
@@ -320,13 +963,10 @@ InstallSubdevice
         //
         port->Release();
     }
-    else
-    {
-        _DbgPrintF(DEBUGLVL_TERSE, ("InstallSubdevice: PcNewPort failed"));
-    }
 
     return ntStatus;
 }
+
 
 /*****************************************************************************
  * StartDevice()
@@ -355,8 +995,8 @@ StartDevice
     // These are the sub-lists of resources that will be handed to the
     // miniports.
     //
+    PRESOURCELIST   resourceListTopology    = NULL;
     PRESOURCELIST   resourceListWave        = NULL;
-    PRESOURCELIST   resourceListWaveTable   = NULL;
     PRESOURCELIST   resourceListFmSynth     = NULL;
     PRESOURCELIST   resourceListUart        = NULL;
     PRESOURCELIST   resourceListAdapter     = NULL;
@@ -365,18 +1005,22 @@ StartDevice
     // These are the port driver pointers we are keeping around for registering
     // physical connections.
     //
-    PUNKNOWN    unknownTopology   = NULL;
-    PUNKNOWN    unknownWave       = NULL;
-    PUNKNOWN    unknownWaveTable  = NULL;
-    PUNKNOWN    unknownFmSynth    = NULL;
+    PUNKNOWN    unknownTopology        = NULL;
+    PUNKNOWN    unknownWave            = NULL;
+    PUNKNOWN    unknownMiniportWave    = NULL;
+    PUNKNOWN    unknownFmSynth         = NULL;
+    PUNKNOWN    unknownMiniportFmSynth = NULL;
+    PUNKNOWN    unknownMiniportUart    = NULL;
+    
+    PDEVICE_CONTEXT pDeviceContext;
 
     //
     // Assign resources to individual miniports.  Each sub-list is a copy
     // of the resources from the master list. Each sublist must be released.
     //
     NTSTATUS ntStatus = AssignResources( ResourceList,
+                                         &resourceListTopology,
                                          &resourceListWave,
-                                         &resourceListWaveTable,
                                          &resourceListFmSynth,
                                          &resourceListUart,
                                          &resourceListAdapter );
@@ -409,7 +1053,7 @@ StartDevice
                 if (NT_SUCCESS(ntStatus))
                 {
                     // Initialize the object
-                    ntStatus = pAdapterCommon->Init( resourceListAdapter,
+                    ntStatus = pAdapterCommon->Init( ResourceList,
                                                      DeviceObject );
                     if (NT_SUCCESS(ntStatus))
                     {
@@ -427,57 +1071,51 @@ StartDevice
             resourceListAdapter->Release();
         }
 
-        //
-        // Start the topology miniport.
-        //
-        if (NT_SUCCESS(ntStatus))
+        // Start the wave table miniport if it exists.
+        if (resourceListWave)
         {
             ntStatus = InstallSubdevice( DeviceObject,
                                          Irp,
-                                         L"Topology",
-                                         CLSID_PortTopology,
-                                         CLSID_PortTopology, // not used
-                                         CreateMiniportTopologySB16,
+                                         L"Wave",
+                                         CLSID_PortWaveCyclic,
+                                         CLSID_PortWaveCyclic, // not used
+                                         CreateMiniportWaveSolo,
                                          pAdapterCommon,
-                                         NULL,
-                                         GUID_NULL,
-                                         NULL,
-                                         &unknownTopology );
+                                         resourceListWave,
+                                         IID_IPortWaveCyclic,
+                                         (PUNKNOWN*)pAdapterCommon->WavePortDriverDest(),
+                                         &unknownWave,
+                                         &unknownMiniportWave);
+
+            
+            // release the wavetable resource list
+            resourceListWave->Release();
         }
 
+
         //
-        // Start the SB wave miniport if it exists.
+        // Start the topology miniport.
         //
-        if (resourceListWave)
+        if (resourceListTopology)
         {
             if (NT_SUCCESS(ntStatus))
             {
                 ntStatus = InstallSubdevice( DeviceObject,
                                              Irp,
-                                             L"Wave",
-                                             CLSID_PortWaveCyclic,
-                                             CLSID_PortWaveCyclic,   // not used
-                                             CreateMiniportWaveCyclicSB16,
+                                             L"Topology",
+                                             CLSID_PortTopology,
+                                             CLSID_PortTopology, // not used
+                                             CreateMiniportTopologyESS,
                                              pAdapterCommon,
-                                             resourceListWave,
-                                             IID_IPortWaveCyclic,
+                                             resourceListTopology,
+                                             GUID_NULL,
                                              NULL,
-                                             &unknownWave );
+                                             &unknownTopology,
+                                             NULL);
             }
 
             // release the wave resource list
-            resourceListWave->Release();
-        }
-
-        // Start the wave table miniport if it exists.
-        if (resourceListWaveTable)
-        {
-            //
-            // NOTE: The wavetable is not currently supported in this sample driver.
-            //
-
-            // release the wavetable resource list
-            resourceListWaveTable->Release();
+            resourceListTopology->Release();
         }
 
         //
@@ -485,10 +1123,6 @@ StartDevice
         //
         if (resourceListFmSynth)
         {
-            //
-            // Synth not working yet.
-            //
-
             if (NT_SUCCESS(ntStatus))
             {
                 //
@@ -498,13 +1132,14 @@ StartDevice
                                   Irp,
                                   L"FMSynth",
                                   CLSID_PortMidi,
-                                  CLSID_MiniportDriverFmSynth,
-                                  NULL,
+                                  CLSID_MiniportDriverESFMSynth,
+                                  CreateMiniportMidiESFM,
                                   pAdapterCommon,
                                   resourceListFmSynth,
                                   GUID_NULL,
                                   NULL,
-                                  &unknownFmSynth );
+                                  &unknownFmSynth,
+                                  &unknownMiniportFmSynth);
             }
 
             // release the FM synth resource list
@@ -516,6 +1151,8 @@ StartDevice
         //
         if (resourceListUart)
         {
+            pAdapterCommon->Init689();
+            
             if (NT_SUCCESS(ntStatus))
             {
                 //
@@ -524,70 +1161,63 @@ StartDevice
                 InstallSubdevice( DeviceObject,
                                   Irp,
                                   L"Uart",
-                                  CLSID_PortDMus,
-                                  CLSID_MiniportDriverDMusUART,
-                                  NULL,
-                                  pAdapterCommon->GetInterruptSync(),
+                                  CLSID_PortMidi,
+                                  CLSID_MiniportDriverUartESS,
+                                  CreateMiniportMidiUartESS,
+                                  pAdapterCommon,
                                   resourceListUart,
-                                  IID_IPortDMus,
-                                  NULL,     //  interface to port not needed
-                                  NULL );   //  not physically connected to anything
+                                  IID_IPortMidi,
+                                  (PUNKNOWN*)pAdapterCommon->MidiPortDriverDest(),
+                                  NULL,    //  not physically connected to anything
+                                  &unknownMiniportUart);
             }
 
             resourceListUart->Release();
         }
 
-        //
-        // Establish physical connections between filters as shown.
-        //
-        //              +------+    +------+
-        //              | Wave |    | Topo |
-        //  Capture <---|0    1|<===|6    2|<--- CD
-        //              |      |    |      |
-        //   Render --->|2    3|===>|0    3|<--- Line In
-        //              +------+    |      |
-        //              +------+    |     4|<--- Mic
-        //              |  FM  |    |      |
-        //     MIDI --->|0    1|===>|1    5|---> Line Out
-        //              +------+    +------+
-        //
-        if (unknownTopology)
+        if (unknownTopology && unknownWave)
         {
-            DWORD version = DeterminePlatform((PPORTTOPOLOGY)unknownTopology);
-            _DbgPrintF(DEBUGLVL_VERBOSE,("Detected platform version 0x%02X",version));
-
-            if (unknownWave)
-            {
-                // register wave <=> topology connections
-                PcRegisterPhysicalConnection( (PDEVICE_OBJECT)DeviceObject,
-                                            unknownTopology,
-                                            6,
-                                            unknownWave,
-                                            1 );
-                PcRegisterPhysicalConnection( (PDEVICE_OBJECT)DeviceObject,
-                                            unknownWave,
-                                            3,
-                                            unknownTopology,
-                                            0 );
-            }
-
-            if (unknownFmSynth)
-            {
-                // register fmsynth <=> topology connection
-                PcRegisterPhysicalConnection( (PDEVICE_OBJECT)DeviceObject,
-                                            unknownFmSynth,
-                                            1,
-                                            unknownTopology,
-                                            1 );
-            }
+            // register wave <=> topology connections
+            PcRegisterPhysicalConnection( (PDEVICE_OBJECT)DeviceObject,
+                                        unknownTopology,
+                                        11,
+                                        unknownWave,
+                                        1 );
+            PcRegisterPhysicalConnection( (PDEVICE_OBJECT)DeviceObject,
+                                        unknownWave,
+                                        3,
+                                        unknownTopology,
+                                        0 );
         }
 
+        if ((pDeviceContext = (PDEVICE_CONTEXT)((PDEVICE_EXTENSION)DeviceObject->DeviceExtension)->DeviceContext) != NULL)
+        {
+            if (unknownMiniportWave)
+            {
+                unknownMiniportWave->QueryInterface( IID_IMiniportWaveCyclic,
+                                                       (PVOID *)&pDeviceContext->MiniportWaveCyclic );
+            }
+
+            if (unknownMiniportFmSynth)
+            {
+                unknownMiniportFmSynth->QueryInterface( IID_IMiniportMidi,
+                                                       (PVOID *)&pDeviceContext->MiniportMidiESFM );
+            }
+
+            if (unknownMiniportUart)
+            {
+                unknownMiniportUart->QueryInterface( IID_IMiniportMidi,
+                                                       (PVOID *)&pDeviceContext->MiniportMidiUartESS );
+            }
+        }
+        
         //
         // Release the adapter common object.  It either has other references,
         // or we need to delete it anyway.
         //
         if (pAdapterCommon)
         {
+            pAdapterCommon->PostProcessing();
             pAdapterCommon->Release();
         }
 
@@ -602,19 +1232,25 @@ StartDevice
         {
             unknownWave->Release();
         }
-        if (unknownWaveTable)
-        {
-            unknownWaveTable->Release();
-        }
         if (unknownFmSynth)
         {
             unknownFmSynth->Release();
         }
-
+        if (unknownMiniportWave)
+        {
+            unknownMiniportWave->Release();
+        }
+        if (unknownMiniportUart)
+        {
+            unknownMiniportUart->Release();
+        }
+        if (NT_SUCCESS(ntStatus))
+            pAdapterCommon->Enable_Irq();
     }
 
     return ntStatus;
 }
+
 
 /*****************************************************************************
  * AssignResources()
@@ -627,107 +1263,53 @@ NTSTATUS
 AssignResources
 (
     IN      PRESOURCELIST   ResourceList,           // All resources.
+    OUT     PRESOURCELIST * ResourceListTopology,   // Topology resources.
     OUT     PRESOURCELIST * ResourceListWave,       // Wave resources.
-    OUT     PRESOURCELIST * ResourceListWaveTable,  // Wave table resources.
     OUT     PRESOURCELIST * ResourceListFmSynth,    // FM synth resources.
     OUT     PRESOURCELIST * ResourceListUart,       // Uart resources.
     OUT     PRESOURCELIST * ResourceListAdapter     // For the adapter
 )
 {
-    PAGED_CODE();
-
-    BOOLEAN     detectedWaveTable   = FALSE;
-    BOOLEAN     detectedUart        = FALSE;
-    BOOLEAN     detectedFmSynth     = FALSE;
-
     //
     // Get counts for the types of resources.
     //
     ULONG countIO  = ResourceList->NumberOfPorts();
     ULONG countIRQ = ResourceList->NumberOfInterrupts();
     ULONG countDMA = ResourceList->NumberOfDmas();
+    ULONG i;
 
-    //
-    // Determine the type of card based on port resources.
-    // TODO:  Detect wave table.
-    //
     NTSTATUS ntStatus = STATUS_SUCCESS;
-
-    switch (countIO)
-    {
-    case 1:
-        //
-        // No FM synth or UART.
-        //
-        if  (   (ResourceList->FindTranslatedPort(0)->u.Port.Length < 16)
-            ||  (countIRQ < 1)
-            ||  (countDMA < 1)
-            )
-        {
-            ntStatus = STATUS_DEVICE_CONFIGURATION_ERROR;
-        }
-        break;
-
-    case 2:
-        //
-        // MPU-401 or FM synth, not both.
-        //
-        if  (   (ResourceList->FindTranslatedPort(0)->u.Port.Length < 16)
-            ||  (countIRQ < 1)
-            ||  (countDMA < 1)
-            )
-        {
-            ntStatus = STATUS_DEVICE_CONFIGURATION_ERROR;
-        }
-        else
-        {
-            //
-            // Length of second port indicates which function.
-            //
-            switch (ResourceList->FindTranslatedPort(1)->u.Port.Length)
-            {
-            case 2:
-                detectedUart = TRUE;
-                break;
-
-            case 4:
-                detectedFmSynth = TRUE;
-                break;
-
-            default:
-                ntStatus = STATUS_DEVICE_CONFIGURATION_ERROR;
-                break;
-            }
-        }
-        break;
-
-    case 3:
-        //
-        // Both MPU-401 and FM synth.
-        //
-        if  (   (ResourceList->FindTranslatedPort(0)->u.Port.Length < 16)
-            ||  (ResourceList->FindTranslatedPort(1)->u.Port.Length != 2)
-            ||  (ResourceList->FindTranslatedPort(2)->u.Port.Length != 4)
-            ||  (countIRQ < 1)
-            ||  (countDMA < 1)
-            )
-        {
-            ntStatus = STATUS_DEVICE_CONFIGURATION_ERROR;
-        }
-        else
-        {
-            detectedUart    = TRUE;
-            detectedFmSynth = TRUE;
-        }
-        break;
-
-    default:
+    
+    if ( countIO != 5 || countIRQ != 1 || countDMA )
         ntStatus = STATUS_DEVICE_CONFIGURATION_ERROR;
-        break;
+
+    //
+    // Build the resource list for the card's wave I/O.
+    //
+    *ResourceListTopology = NULL;
+    if (NT_SUCCESS(ntStatus))
+    {
+        ntStatus =
+            PcNewResourceSublist
+            (
+                ResourceListTopology,
+                NULL,
+                PagedPool,
+                ResourceList,
+                1
+            );
+
+        if (NT_SUCCESS(ntStatus))
+        {
+            //
+            // Add the base address
+            //
+            ASSERT(NT_SUCCESS((*ResourceListTopology)->AddPortFromParent(ResourceList,1)));
+        }
     }
 
     //
-    // Build the resource list for the SB wave I/O.
+    // Build list of resources for wave table.
     //
     *ResourceListWave = NULL;
     if (NT_SUCCESS(ntStatus))
@@ -739,61 +1321,21 @@ AssignResources
                 NULL,
                 PagedPool,
                 ResourceList,
-                countDMA + countIRQ + 1
+                2
             );
 
         if (NT_SUCCESS(ntStatus))
         {
-            ULONG i;
-
-            //
-            // Add the base address
-            //
-            ntStatus = (*ResourceListWave)->
-                AddPortFromParent(ResourceList,0);
-
-            //
-            // Add the DMA channel(s).
-            //
-            if (NT_SUCCESS(ntStatus))
-            {
-                for (i = 0; i < countDMA; i++)
-                {
-                    ntStatus = (*ResourceListWave)->
-                        AddDmaFromParent(ResourceList,i);
-                }
-            }
-
-            //
-            // Add the IRQ lines.
-            //
-            if (NT_SUCCESS(ntStatus))
-            {
-                for (i = 0; i < countIRQ; i++)
-                {
-                    SUCCEEDS((*ResourceListWave)->
-                        AddInterruptFromParent(ResourceList,i));
-                }
-            }
+            ASSERT(NT_SUCCESS((*ResourceListWave)->AddPortFromParent(ResourceList,1)));
+            ASSERT(NT_SUCCESS((*ResourceListWave)->AddInterruptFromParent(ResourceList,0)));
         }
-    }
-
-    //
-    // Build list of resources for wave table.
-    //
-    *ResourceListWaveTable = NULL;
-    if (NT_SUCCESS(ntStatus) && detectedWaveTable)
-    {
-        //
-        // TODO:  Assign wave table resources.
-        //
     }
 
     //
     // Build list of resources for UART.
     //
     *ResourceListUart = NULL;
-    if (NT_SUCCESS(ntStatus) && detectedUart)
+    if (NT_SUCCESS(ntStatus))
     {
         ntStatus =
             PcNewResourceSublist
@@ -807,14 +1349,8 @@ AssignResources
 
         if (NT_SUCCESS(ntStatus))
         {
-            ntStatus = (*ResourceListUart)->
-                AddPortFromParent(ResourceList,1);
-            
-            if (NT_SUCCESS(ntStatus))
-            {
-                ntStatus = (*ResourceListUart)->
-                    AddInterruptFromParent(ResourceList,0);
-            }
+            ASSERT(NT_SUCCESS((*ResourceListUart)->AddPortFromParent(ResourceList,3)));
+            ASSERT(NT_SUCCESS((*ResourceListUart)->AddInterruptFromParent(ResourceList,0)));
         }
     }
 
@@ -822,7 +1358,7 @@ AssignResources
     // Build list of resources for FM synth.
     //
     *ResourceListFmSynth = NULL;
-    if (NT_SUCCESS(ntStatus) && detectedFmSynth)
+    if (NT_SUCCESS(ntStatus))
     {
         ntStatus =
             PcNewResourceSublist
@@ -836,8 +1372,8 @@ AssignResources
 
         if (NT_SUCCESS(ntStatus))
         {
-            ntStatus = (*ResourceListFmSynth)->
-                AddPortFromParent(ResourceList,detectedUart ? 2 : 1);
+            ASSERT(NT_SUCCESS((*ResourceListFmSynth)->AddPortFromParent(ResourceList,1)));
+            (*ResourceListFmSynth)->FindTranslatedPort(0)->u.Generic.Length = 4;
         }
     }
 
@@ -854,7 +1390,7 @@ AssignResources
                 NULL,
                 PagedPool,
                 ResourceList,
-                3
+                6
             );
 
         if (NT_SUCCESS(ntStatus))
@@ -862,25 +1398,14 @@ AssignResources
             //
             // The interrupt to share.
             //
-            ntStatus = (*ResourceListAdapter)->
-                AddInterruptFromParent(ResourceList,0);
+            ASSERT(NT_SUCCESS((*ResourceListAdapter)->AddInterruptFromParent(ResourceList,0)));
 
             //
             // The base IO port (to tell who's interrupt it is)
             //
-            if (NT_SUCCESS(ntStatus))
+            for ( i = 0; i < countIO; i++ )
             {
-                ntStatus = (*ResourceListAdapter)->
-                    AddPortFromParent(ResourceList,0);
-            }
-
-            if (detectedUart && NT_SUCCESS(ntStatus))
-            {
-                //
-                // The Uart port
-                //
-                ntStatus = (*ResourceListAdapter)->
-                    AddPortFromParent(ResourceList,1);
+                ASSERT(NT_SUCCESS((*ResourceListAdapter)->AddPortFromParent(ResourceList,i)));
             }
         }
     }
@@ -890,15 +1415,15 @@ AssignResources
     //
     if (! NT_SUCCESS(ntStatus))
     {
+        if (*ResourceListTopology)
+        {
+            (*ResourceListTopology)->Release();
+            *ResourceListTopology = NULL;
+        }
         if (*ResourceListWave)
         {
             (*ResourceListWave)->Release();
             *ResourceListWave = NULL;
-        }
-        if (*ResourceListWaveTable)
-        {
-            (*ResourceListWaveTable)->Release();
-            *ResourceListWaveTable = NULL;
         }
         if (*ResourceListUart)
         {
@@ -921,143 +1446,13 @@ AssignResources
     return ntStatus;
 }
 
-#ifdef DO_RESOURCE_FILTERING
-
-/*****************************************************************************
- * AdapterDispatchPnp()
- *****************************************************************************
- * Supplying your PnP resource filtering needs.
- */
-extern "C"
-NTSTATUS
-AdapterDispatchPnp
-(
-    IN      PDEVICE_OBJECT  pDeviceObject,
-    IN      PIRP            pIrp
-)
-{
-    PAGED_CODE();
-
-    ASSERT(pDeviceObject);
-    ASSERT(pIrp);
-
-    NTSTATUS ntStatus = STATUS_SUCCESS;
-
-    PIO_STACK_LOCATION pIrpStack =
-        IoGetCurrentIrpStackLocation(pIrp);
-
-    if( pIrpStack->MinorFunction == IRP_MN_FILTER_RESOURCE_REQUIREMENTS )
-    {
-        //
-        // Do your resource requirements filtering here!!
-        //
-        _DbgPrintF(DEBUGLVL_VERBOSE,("[AdapterDispatchPnp] - IRP_MN_FILTER_RESOURCE_REQUIREMENTS"));
-
-        // set the return status
-        pIrp->IoStatus.Status = ntStatus;
-
-    }
-
-    //
-    // Pass the IRPs on to PortCls
-    //
-    ntStatus = PcDispatchIrp( pDeviceObject,
-                              pIrp );
-
-    return ntStatus;
-}
-
-#endif
 
 
-/*****************************************************************************
- * DeterminePlatform()
- *****************************************************************************
- * Figure out which WDM platform we are currently running on.
- * Note: the Port parameter could be WAVECYCLIC, WAVEPCI, DMUS or MIDI instead.
- *
- * TODO: Make this work on old DDK.
- *
- */
-DWORD DeterminePlatform(PPORTTOPOLOGY Port)
-{
-    PAGED_CODE();
-    ASSERT(Port);
 
-    //
-    // The generally accepted way of determining audio stack vintage:
-    //
-    PPORTCLSVERSION pPortClsVersion=NULL;
-    PDRMPORT        pDrmPort=NULL;
-    PPORTEVENTS     pPortEvents=NULL;
-    DWORD           dwVersion;
 
-    (void) Port->QueryInterface( IID_IPortClsVersion, (PVOID *) &pPortClsVersion);
 
-    //
-    //  Try for the exact release (Win98SE QFE3, WinME QFE, Win2KSP2, WinXP, or later).
-    //
-    if (pPortClsVersion)
-    {
-        dwVersion = pPortClsVersion->GetVersion();
-        pPortClsVersion->Release();
-        return dwVersion;
-    } 
-    
-    (void) Port->QueryInterface( IID_IDrmPort,        (PVOID *) &pDrmPort);
-       
-    if (pDrmPort)    //  Try for WinME
-    {
-        dwVersion = kVersionWinME;
-        ASSERT(IoIsWdmVersionAvailable(0x01,0x05));
-        //
-        //  TODO: Look for registry entries that denote WinME QFEs
-        //  HKLM\Software\Microsoft\Windows\CurrentVersion\Setup\Updates\..., etc.
-        //
-        pDrmPort->Release();
-        return dwVersion;
 
-    } 
-    
-    //  Try for Win2K family.
-    //  Note that SP1 contains no real audio stack changes, 
-    //  while SP2 contains non-PCM support and other fixes.
-    if (IoIsWdmVersionAvailable(0x01,0x10))    
-    {                                                  
-        //
-        dwVersion = kVersionWin2K;
-        //
-        //  TODO: Detect whether SP1 or earlier.
-        //
-        return dwVersion;
-    }
-    //
-    //  Must be Win98 or Win98SE.  
-    //  IPortEvents was new in Win98SE.
-    //
-    (void) Port->QueryInterface( IID_IPortEvents,     (PVOID *) &pPortEvents);
-    if (pPortEvents)
-    {
-        dwVersion = kVersionWin98SE; // or older QFEs
-        //
-        //  TODO: Look for registry entries that denote older Win98SE QFEs
-        //  HKLM\Software\Microsoft\Windows\CurrentVersion\Setup\Updates\W98.SE\UPD\269601, etc.
-        //
-        pPortEvents->Release();
-        return dwVersion;
-    }
-    //
-    //  Process of elimination tells us it is Win98.
-    //
-    dwVersion = kVersionWin98;
 
-    //
-    //  TODO: Look for registry entries that denote older Win98 QFEs
-    //  HKLM\Software\Microsoft\Windows\CurrentVersion\Setup\Updates\..., etc.
-    // 
-  
-    return dwVersion;
-}
 
 #pragma code_seg()
 

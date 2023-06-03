@@ -46,59 +46,12 @@ static OVERLAPPED VolumeOverlapped;// For asynch IO for volume notify
  */
 
 
-/*************************************************************************
-VolLinearToLog - converts a linear scale to logarithm
-        0xffff -> 0
-        0x0001 -> 191
-
-inputs
-        WORD    volume - 0 to 0xffff
-returns
-        BYTE    - value in decibels attenuation, each unit is 1.5 dB
-*/
-BYTE VolLinearToLog (WORD volume)
-{
-    WORD    gain, shift;
-    WORD    temp;
-    WORD    lut[16] = {0,0,0,1,1,1,2,2,2,2,3,3,3,3,3,3};
-    BYTE    out;
-
-    /* get an estimate to within 6 dB of gain */
-    for (temp = volume, gain = 0, shift = 0;
-        temp != 0;
-        gain += 4, temp >>= 1, shift++);
-
-    /* look at highest 3 bits in number into look-up-table to
-        find how many more dB */
-    if (shift > 5)
-        temp = volume >> (shift - 5);
-    else if (shift < 5)
-        temp = volume << (5 - shift);
-    else
-        temp = volume;
-    temp &= 0x000f;
-
-    gain += lut[temp];
-
-    out = (BYTE) ((16 * 4) + 3 - gain);
-    return (out < 128) ? out : (BYTE)127;
-}
-
 /*
  *  Set the MIDI device volume
  */
 
 VOID MidiSetTheVolume(DWORD Left, DWORD Right)
 {
-    CurrentVolume.Left = Left;
-    CurrentVolume.Right = Right;
-
-
-    //
-    // Call the routine to store and set the settings
-    //
-
-    MidiNewVolume(VolLinearToLog(HIWORD(Left)), VolLinearToLog(HIWORD(Right)));
 }
 
 /*
@@ -238,6 +191,7 @@ MMRESULT MidiOpenDevice(LPHANDLE lpHandle, BOOL Write)
          * for this device type. MidiInit can have a static bInit if needed
          */
         MidiInit();
+        fmreset();
 
         //
         // Create an event for waiting for volume changes and an
@@ -357,37 +311,4 @@ MMRESULT MidiSetVolume(DWORD Left, DWORD Right)
     return mRc;
 }
 
-
-/**************************************************************
- * MidiSendFM - Sends a byte to the FM chip.
- *
- * inputs
- *      WORD    wAddress - 0x00 to 0x1ff
- *      BYTE    bValue - value wirtten
- * returns
- *      none
- */
-VOID FAR PASCAL MidiSendFM (DWORD wAddress, BYTE bValue)
-{
-
-
-    // NT :
-    //
-    // Pipe our port writes to the kernel driver
-    // Note that MidiFlush is called again after each midi message
-    // is processed by modMessage.
-    //
-
-    if (MidiPosition == SYNTH_DATA_SIZE) {
-            MidiFlush();
-    }
-
-    DeviceData[MidiPosition].IoPort = wAddress < 0x100 ? 0x388 : 0x38a;
-    DeviceData[MidiPosition].PortData = (WORD)(BYTE)wAddress;
-    DeviceData[MidiPosition + 1].IoPort = wAddress < 0x100 ? 0x389 : 0x38b;
-    DeviceData[MidiPosition + 1].PortData = (WORD)bValue;
-
-    MidiPosition += 2;
-
-}
 

@@ -2,7 +2,9 @@
  *
  *   config.c
  *
- *   Copyright (c) Microsoft Corporation 1993-1994. All rights reserved.
+ *   Reconstruction of ESS NT4 driver sourcecode
+ *
+ *   Copyright (c) leecher@dose.0wnz.at  2023. All rights reserved.
  *
  ***************************************************************************/
 
@@ -24,7 +26,7 @@
 
 
 
-TCHAR STR_PRODUCTNAME[]    = TEXT("Sound Blaster");
+TCHAR STR_PRODUCTNAME[]    = TEXT("AUDDRIVE");
 
 #define INVALID_DSP_VERSION ((DWORD)-1)
 
@@ -39,15 +41,11 @@ TCHAR STR_PRODUCTNAME[]    = TEXT("Sound Blaster");
 
  typedef struct {
      UINT  CardId;          // Card number
-     DWORD Port;            // Port number
-     DWORD MPU401Port;      // MPU401 Port number
-     DWORD Interrupt;       // Interrupt
-     DWORD DmaChannel;      // Dma Channel number
-     DWORD DmaChannel16;    // Dma Channel number for 16-bit record
+     DWORD Interrupt;       // Capture IRQ    
      DWORD LoadType;        // Normal or configuration
      DWORD DmaBufferSize;   // Size for DMA buffer
      DWORD SynthType;       // Opl3?
- } SB_CONFIG, *PSB_CONFIG;
+ } ES_CONFIG, *PES_CONFIG;
 
 /************************
 
@@ -55,12 +53,36 @@ TCHAR STR_PRODUCTNAME[]    = TEXT("Sound Blaster");
 
 *************************/
 DWORD     CurrentCard;
+DWORD     CurrentPort;
 DWORD     NumberOfCards;
-DWORD     DSPVersion;
-SB_CONFIG Configuration;
-DWORD     InterruptsInUse;
-DWORD     DmaChannelsInUse;
+ES_CONFIG Configuration;
 BOOL      FirstTime;
+
+DWORD     IrqChoices[] = {2, 3, 5, 7, 9, 10, 11, 12, 15, 0, 0, 0, 0, 0, 0, 0};
+
+// Config 
+DWORD  SOUND_DEF_INT  = 11;
+BOOL   SOUND_DEF_ENABLE_AUTO_INSTALL = TRUE;
+BOOL   SOUND_DEF_MUTE_PHONE = TRUE;
+BOOL   SOUND_DEF_NEW_LAPTOP_SYS = TRUE;
+BOOL   SOUND_DEF_ENABLE_MPU401 = TRUE;
+
+DWORD  SOUND_DEF_ES938 = 0;
+DWORD  SOUND_DEF_DISABLE_MICGAIN = 0;
+DWORD  SOUND_DEF_2WIRES_EXTHWVOL = 0;
+DWORD  SOUND_DEF_USE_MONOIN = 0;
+DWORD  SOUND_DEF_SINGLE_TX_DMA = 0;
+DWORD  SOUND_DEF_3D_LIMIT = 0;
+DWORD  SOUND_DEF_SPATIALIZER_ENABLE = 0;
+DWORD  SOUND_DEF_DEFAULT_EXT_MIDI = 0;
+DWORD  SOUND_DEF_DISABLE_AUXB = 0;
+DWORD  SOUND_DEF_RECORD_MONITOR_MODE =0;
+DWORD  SOUND_DEF_ENABLE_IIS = 0;
+DWORD  SOUND_DEF_SOFTEX_APM = 0;
+
+DWORD  LoadDriverDuringBoot = 0;
+
+
 
 
 WNDPROC OldButtonProc;
@@ -71,8 +93,6 @@ TCHAR   g_szAppFontName[] = TEXT("MS Shell Dlg");
 RECT    g_OrgRect[MAX_IDDS];
 RECT    g_OrgRectDlg;
 
-TCHAR   g_szSetupApiDll[] = TEXT( "setupapi.dll" );
-
 
 /*****************************************************************************
 
@@ -82,36 +102,31 @@ TCHAR   g_szSetupApiDll[] = TEXT( "setupapi.dll" );
 
 int     Configure(HWND hDlg);
 BOOL    CenterPopup(HWND hWnd, HWND hParentWnd);
-VOID    GetDriverConfig(UINT CardId, PSB_CONFIG Config);
-BOOL    SetDriverConfig(PSB_CONFIG Config);
-INT     DoPnPDialog(IN  HDEVINFO            DeviceInfoSet,
-                    IN  PSP_DEVINFO_DATA    DeviceInfoData,
-                    IN  HWND                hwndParent);
+VOID    GetDriverConfig(UINT CardId, PES_CONFIG Config);
+BOOL    SetDriverConfig(PES_CONFIG Config);
+void    ReadConfigini(BOOL ParseOptions);
+void
+ GetRealString(
+     PREG_ACCESS RegAccess,
+     UINT   DeviceNumber,
+     BYTE   StringId,
+     LPTSTR Value);
+VOID AddEssAPMEntry();
+LONG DrvSetOptions(
+     PREG_ACCESS RegAccess,
+     UINT   DeviceNumber,
+     LPTSTR ValueName,
+     LPTSTR Value);
+LONG DrvSetBinaryValue(
+     PREG_ACCESS RegAccess,
+     UINT   DeviceNumber,
+     LPTSTR ValueName,
+     LPBYTE Value,
+     DWORD  ValueSize);
+     
+BOOL ESConfigEqual(IN  PES_CONFIG Config1,
+                   IN  PES_CONFIG Config2);
 
-BOOL    GetPnPConfig(IN  DEVINST    DevInst,
-                     IN  ULONG      LogConfigType,
-                     OUT PSB_CONFIG Configuration);
-
-BOOL CALLBACK AddPropSheetPageProc(IN HPROPSHEETPAGE hpage,
-                                   IN LPARAM lParam);
-
-BOOL SBConfigEqual(IN  PSB_CONFIG Config1,
-                   IN  PSB_CONFIG Config2);
-
-HDEVINFO OpenPnPDeviceInstance(IN HWND hwndParent,
-                               OUT PSP_DEVINFO_DATA DeviceInfoData);
-
-LONG SndblstSetDeviceIdStringParameter(PREG_ACCESS RegAccess,
-                                       UINT   DeviceNumber,
-                                       LPTSTR ValueName,
-                                       LPTSTR Value,
-                                       DWORD  ValueSize);
-
-LONG SndblstQueryDeviceIdStringParameter(PREG_ACCESS RegAccess,
-                                         UINT   DeviceNumber,
-                                         LPTSTR ValueName,
-                                         LPTSTR Value,
-                                         DWORD  ValueSize);
 
 LRESULT CALLBACK
 ButtonSubClassProc(
@@ -170,15 +185,11 @@ GetOriginalControlPositions(
 **  Set the configuration to invalid - this will stop SetDriverConfig writing
 **  things we didn't set
 */
-VOID InitConfiguration(PSB_CONFIG Config)
+VOID InitConfiguration(PES_CONFIG Config)
 {
-    Config->Port          = (DWORD)-1;
-    Config->MPU401Port    = (DWORD)-2;
     Config->Interrupt     = (DWORD)-1;
-    Config->DmaChannel    = (DWORD)-1;
-    Config->DmaChannel16  = SOUND_DEF_DMACHANNEL16;
-    Config->DmaBufferSize = (DWORD)-1;
     Config->SynthType     = (DWORD)-1;
+    Config->LoadType      = SOUND_LOADTYPE_NORMAL;
 }
 
 
@@ -191,46 +202,6 @@ LRESULT ConfigRemove(HWND hDlg)
 {
     BOOL    Unloaded;
     BOOL    Deleted;
-    BOOL    IsPnPDevice;
-    TCHAR   PnPDeviceID[MAX_PATH];
-    DWORD   PnPDeviceIDSize;
-    //
-    //  If this is a PnP device we need to inform the class installer
-    //  that we are going away.
-    //
-    PnPDeviceIDSize = sizeof(PnPDeviceID);
-    IsPnPDevice = (ERROR_SUCCESS == SndblstQueryDeviceIdStringParameter(
-                                        &RegAccess,
-                                        CurrentCard,
-                                        SOUND_REG_PNPDEVICE,
-                                        (LPTSTR)PnPDeviceID,
-                                        PnPDeviceIDSize));
-
-    //
-    //  If this device is a PnP device, go through setupapi
-    //  to let PnP know that the device is going away.
-    //
-    if( IsPnPDevice )
-    {
-        HDEVINFO DeviceInfoSet;
-        SP_DEVINFO_DATA DeviceInfoData;
-
-        DeviceInfoSet = OpenPnPDeviceInstance(hDlg,
-                                              &DeviceInfoData);
-
-        if(DeviceInfoSet == INVALID_HANDLE_VALUE)
-        {
-            ConfigErrorMsgBox(hDlg, IDS_ERROR_UNKNOWN);
-            return DRVCNF_CANCEL;
-        }
-        else
-        {
-            if(!DLSetupDiRemoveDevice(DeviceInfoSet, &DeviceInfoData))
-                return DRVCNF_CANCEL;
-
-            DLSetupDiDestroyDeviceInfoList(DeviceInfoSet);
-        }
-    }
 
     //
     // Is the driver currently loaded
@@ -266,57 +237,97 @@ LRESULT ConfigRemove(HWND hDlg)
     }
 }
 
-/**********************************************************************
- *
- *  Determine which dialogue to use based upon the DSP version
- *
- **********************************************************************/
-
-DWORD VersionToDlgId(DWORD DSPVersion)
+void Setupmidimapper()
 {
-    DWORD DialogId;
-
-    if (DSPVersion == INVALID_DSP_VERSION) {
-        return (DLG_PORTSELECT);
-    }
-
-    if (DSPVersion < 0x200) {
-       DialogId = (DLG_SB1CONFIG);
-    } else {
-       if (DSPVersion == 0x200) {
-          DialogId = (DLG_SB15CONFIG);
-       } else {
-           if (DSPVersion < 0x0300) {
-               DialogId = (DLG_SB20CONFIG);
-           } else {
-               if (DSPVersion < 0x400) {
-                   DialogId = (DLG_SBPROCONFIG);
-               } else {
-                   DialogId = (DLG_SB16CONFIG);
-               }
-           }
-       }
-    }
-
-    return DialogId;
+    DrvQueryDeviceIdParameter(
+        &RegAccess, 
+        Configuration.CardId, 
+        SOUND_REG_SYNTH_TYPE, 
+        &Configuration.SynthType);
+        
+    if ( Configuration.SynthType != (DWORD)-1 )
+        DrvSetMapperName(ESS_MAPPER_ESS_ESFM);
 }
 
-/*
-**  Work out the default DMA buffer size.  Anything less than
-**  an SB16 really only needs 4K because the most that can be done is
-**  44Khz mono (or 22Khz stereo).  This gets multiplied by 4 for the 16.
-*/
-DWORD DefaultDmaBufferSize(DWORD DSPVersion)
+void  SetupSoundMapperName
+(
+    PREG_ACCESS RegAccess, 
+    int DeviceNumber, 
+    BYTE StringIdPlayback, 
+    BYTE StringIdRecord
+)
 {
-    if (DSPVersion == INVALID_DSP_VERSION) {
-        return (DWORD)-1;
-    }
-    if (DSPVersion < 0x400) {
-        return 0x1000;            // 4K
-    } else {
-        return 0x4000;        // 16K
+    HKEY hKey;
+    TCHAR String[128];
+    LONG ReturnCode;
+    
+    if (RegOpenKeyEx(
+           HKEY_USERS,
+           TEXT(".DEFAULT\\Software\\Microsoft\\Multimedia\\Sound Mapper"),
+           0,
+           KEY_ALL_ACCESS,
+           &hKey
+        ) != ERROR_SUCCESS) return;
+
+    GetRealString(RegAccess, DeviceNumber, StringIdPlayback, String);
+    RegSetValueEx(hKey,  TEXT("Playback"), 0, REG_SZ, (PBYTE)String, ByteCountOf(lstrlen(String)+1));
+    GetRealString(RegAccess, DeviceNumber, StringIdRecord, String);
+    ReturnCode = RegSetValueEx(hKey, TEXT("Record"), 0, REG_SZ, (PBYTE)String, ByteCountOf(lstrlen(String)+1));
+    RegCloseKey(hKey);
+    
+    if (ReturnCode == ERROR_SUCCESS && 
+        RegOpenKeyEx(
+            HKEY_CURRENT_USER, 
+            TEXT("Software\\Microsoft\\Multimedia\\Sound Mapper"), 
+            0, 
+            KEY_ALL_ACCESS, 
+            &hKey
+        ) == ERROR_SUCCESS)
+    {
+        GetRealString(RegAccess, DeviceNumber, StringIdPlayback, String);
+        RegSetValueEx(hKey, TEXT("Playback"), 0, REG_SZ, (PBYTE)String, ByteCountOf(lstrlen(String)+1));
+        GetRealString(RegAccess, DeviceNumber, StringIdRecord, String);
+        RegSetValueExW(hKey, TEXT("Record"), 0, REG_SZ, (PBYTE)String, ByteCountOf(lstrlen(String)+1));
+        RegCloseKey(hKey);
     }
 }
+
+void SetupDefaultRecordFormat()
+{
+    HKEY hKey;
+    LONG ReturnCode;
+    TCHAR DefaultFormat[24] = TEXT("Default Record Quality");
+    BYTE DefaultQuality[36] = {
+        1, 0, 1, 0, 34, 86, 0, 0, 68, 172, 0, 0, 
+        2, 0, 16, 0, 32, 128, 77, 115, 120, 98, 51, 48, 
+        51, 50, 46, 100, 0, 0, 0 ,0, 12, 1, 118, 0};
+
+    if (RegOpenKeyEx(
+            HKEY_CURRENT_USER, 
+            TEXT("Software\\Microsoft\\Multimedia\\Audio"), 
+            0, 
+            KEY_ALL_ACCESS, 
+            &hKey
+        ) == ERROR_SUCCESS)
+    {
+        ReturnCode = RegSetValueEx(hKey, TEXT("DefaultFormat"), 0, REG_SZ, (PBYTE)DefaultFormat, ByteCountOf(lstrlen(DefaultFormat)+1));
+        RegCloseKey(hKey);
+        if (ReturnCode == ERROR_SUCCESS && 
+            RegOpenKeyEx(
+                HKEY_CURRENT_USER, 
+                TEXT("Software\\Microsoft\\Multimedia\\Audio\\WaveFormats"), 
+                0, 
+                KEY_ALL_ACCESS, 
+                &hKey
+            ) == ERROR_SUCCESS)
+        {
+            RegSetValueEx(hKey, TEXT("Default Record Quality"), 0, REG_BINARY, DefaultQuality, sizeof(DefaultQuality));
+            RegCloseKey(hKey);
+        }
+    }
+}
+
+
 
 
 /****************************************************************************
@@ -334,33 +345,22 @@ int Config(HWND hWnd, HANDLE hInstance)
 {
     BOOL      ReturnCode;
     BOOL      DriverWasLoaded;
-    SB_CONFIG InitConfig;
-    BOOL      IsPnPDevice;
-    TCHAR     PnPDeviceID[MAX_PATH];
-    DWORD     PnPDeviceIDSize;
+    ES_CONFIG InitConfig;
+    BOOL      AutoInstall;
 
-    DSPVersion  = INVALID_DSP_VERSION;
+    CurrentPort = (DWORD)-1;
+    AutoInstall = FALSE;
     FirstTime   = TRUE;
 
     /*
     **  Find out what stuff is in use!
     */
 
-    GetInterruptsAndDMA(&InterruptsInUse, &DmaChannelsInUse, STR_DRIVERNAME);
-
     DriverWasLoaded = DrvIsDriverLoaded(&RegAccess);
 
     CurrentCard   = 0;
 
     DrvNumberOfDevices(&RegAccess, &NumberOfCards);
-    if (!bInstall && NumberOfCards != 0) {
-        DSPVersion = INVALID_DSP_VERSION;
-        DrvQueryDeviceIdParameter(
-            &RegAccess,
-            CurrentCard,
-            SOUND_REG_DSP_VERSION,
-            &DSPVersion );
-    }
 
     if (!bInstall) {
 	// Save configuration in case Dialog is cancelled
@@ -380,73 +380,60 @@ int Config(HWND hWnd, HANDLE hInstance)
             return DRVCNF_CANCEL;
         }
     }
-
-    //
-    //  Check the registry to see if this is a PnP card
-    //
-    PnPDeviceIDSize = sizeof(PnPDeviceID);
-    IsPnPDevice = (ERROR_SUCCESS == SndblstQueryDeviceIdStringParameter(
-                                        &RegAccess,
-                                        CurrentCard,
-                                        SOUND_REG_PNPDEVICE,
-                                        (LPTSTR)PnPDeviceID,
-                                        PnPDeviceIDSize));
-
-    //
-    //  If this device is a PnP device, go through the setupapi
-    //  resource chooser
-    //
-    if( IsPnPDevice )
-    {
-        HDEVINFO        DeviceInfoSet;
-        SP_DEVINFO_DATA DeviceInfoData;
-        INT             DialogReturnCode;
-
-        DeviceInfoSet = OpenPnPDeviceInstance(hWnd,
-                                              &DeviceInfoData);
-
-        if(DeviceInfoSet == INVALID_HANDLE_VALUE) {
-            DialogReturnCode = 0;
-        } else {
-            DialogReturnCode = DoPnPDialog(DeviceInfoSet,
-                                           &DeviceInfoData,
-                                           hWnd);
-
-            DLSetupDiDestroyDeviceInfoList(DeviceInfoSet);
-
-            if (DialogReturnCode)
-                ReturnCode = DRVCNF_RESTART;
-            else
-                ReturnCode = DRVCNF_CANCEL;
-        }
-    }
-    else
-    {
-
-        ReturnCode = DialogBox( hInstance,
-                                MAKEINTRESOURCE(DLG_SB16CONFIG),
-                                hWnd,
-                                (DLGPROC)ConfigDlgProc );
     
-        if (ReturnCode == DRVCNF_CANCEL) {
-            if (bInstall) {
-                DrvRemoveDriver(&RegAccess);
-            } else {
-                //
-                // only reload the driver if we know that the settings
-                // changed.
-                //
-                if (!SBConfigEqual(&InitConfig, &Configuration))
+    if (NumberOfCards == 1)
+        ReadConfigini(TRUE);
+    
+    if (SOUND_DEF_ENABLE_AUTO_INSTALL)
+    {
+        BOOL Success;
+        DWORD AutoInstall;
+        
+        if (!DriverWasLoaded)
+            DrvSetDeviceIdParameter(&RegAccess, CurrentCard, SOUND_REG_AUTO_INSTALL, TRUE);
+        Success = DrvConfigureDriver(&RegAccess, STR_DRIVERNAME, SoundDriverTypeNormal, NULL, NULL);
+        DrvQueryDeviceIdParameter(&RegAccess, CurrentCard, SOUND_REG_AUTO_INSTALL, &AutoInstall);
+        if (DriverWasLoaded && AutoInstall || Success)
+        {
+            ReadConfigini(TRUE);
+            Setupmidimapper();
+            DrvSetMapperName(ESS_MAPPER_ESS);
+            SetupSoundMapperName(&RegAccess, CurrentCard, 104, 103);
+            SetupDefaultRecordFormat();
+            return DRVCNF_RESTART;
+        }
+        if (AutoInstall)
+            DrvDeleteServicesNode(&RegAccess);
+    }
+
+    DrvSetDeviceIdParameter(&RegAccess, CurrentCard, SOUND_REG_AUTO_INSTALL, FALSE);
+
+    if ( NumberOfCards == 1 )
+        ReadConfigini(FALSE);
+
+    ReturnCode = DialogBox( hInstance,
+                            MAKEINTRESOURCE(DLG_ESSCONFIG),
+                            hWnd,
+                            (DLGPROC)ConfigDlgProc );
+
+    if (ReturnCode == DRVCNF_CANCEL) {
+        if (bInstall) {
+            DrvRemoveDriver(&RegAccess);
+        } else {
+            //
+            // only reload the driver if we know that the settings
+            // changed.
+            //
+            if (!ESConfigEqual(&InitConfig, &Configuration))
+            {
+                SetDriverConfig(&InitConfig);
+                if (DriverWasLoaded)
                 {
-                    SetDriverConfig(&InitConfig);
-                    if (DriverWasLoaded)
-                    {
-                        DrvConfigureDriver(&RegAccess,
-                                           STR_DRIVERNAME,
-                                           SoundDriverTypeNormal,
-                                           NULL,
-                                           NULL);
-                    }
+                    DrvConfigureDriver(&RegAccess,
+                                       STR_DRIVERNAME,
+                                       SoundDriverTypeNormal,
+                                       NULL,
+                                       NULL);
                 }
             }
         }
@@ -470,7 +457,7 @@ int Config(HWND hWnd, HANDLE hInstance)
  *     Config copied into Config (unobtainable values set to (DWORD)-1)
  *
  ****************************************************************************/
-VOID GetDriverConfig(UINT CardId, PSB_CONFIG Config)
+VOID GetDriverConfig(UINT CardId, PES_CONFIG Config)
 {
     Config->CardId         = CardId;
 
@@ -482,32 +469,12 @@ VOID GetDriverConfig(UINT CardId, PSB_CONFIG Config)
 
     DrvQueryDeviceIdParameter(&RegAccess,
                               CardId,
-                              SOUND_REG_PORT,
-                              &Config->Port);
-
-    DrvQueryDeviceIdParameter(&RegAccess,
-                              CardId,
-                              SOUND_REG_MPU401_PORT,
-                              &Config->MPU401Port);
-
-    DrvQueryDeviceIdParameter(&RegAccess,
-                              CardId,
                               SOUND_REG_INTERRUPT,
                               &Config->Interrupt);
 
     if (Config->Interrupt == 9) {
         Config->Interrupt = 2;
     }
-
-    DrvQueryDeviceIdParameter(&RegAccess,
-                              CardId,
-                              SOUND_REG_DMACHANNEL,
-                              &Config->DmaChannel);
-
-    DrvQueryDeviceIdParameter(&RegAccess,
-                              CardId,
-                              SOUND_REG_DMACHANNEL16,
-                              &Config->DmaChannel16);
 
     DrvQueryDeviceIdParameter(&RegAccess,
                               CardId,
@@ -532,71 +499,27 @@ VOID GetDriverConfig(UINT CardId, PSB_CONFIG Config)
  *
  * @rdesc Returns TRUE if success, FALSE otherwise.
  ***************************************************************************/
-BOOL SetDriverConfig(PSB_CONFIG Config)
+BOOL SetDriverConfig(PES_CONFIG Config)
 {
-
-    /* We set the DMA channel and interrupt values  */
-    /* and set the returned version to 0            */
-    /*                                              */
-    /* If any of these calls fail then give up      */
-
-
-    if (Config->DmaChannel != (DWORD)-1 &&
-        DrvSetDeviceIdParameter(
-            &RegAccess,
-            Config->CardId,
-            SOUND_REG_DMACHANNEL,
-            Config->DmaChannel) != ERROR_SUCCESS ||
-        DrvSetDeviceIdParameter(
-            &RegAccess,
-            Config->CardId,
-            SOUND_REG_DMACHANNEL16,
-            Config->DmaChannel16) != ERROR_SUCCESS ||
-        Config->Port != (DWORD)-1 &&
-        DrvSetDeviceIdParameter(
-            &RegAccess,
-            Config->CardId,
-            SOUND_REG_PORT,
-            Config->Port) != ERROR_SUCCESS ||
-        DrvSetDeviceIdParameter(
-            &RegAccess,
-            Config->CardId,
-            SOUND_REG_MPU401_PORT,
-            Config->MPU401Port) != ERROR_SUCCESS ||
-        Config->Interrupt != (DWORD)-1 &&
-        DrvSetDeviceIdParameter(
+    if (Config->Interrupt != (DWORD)-1)
+    {
+        if (DrvSetDeviceIdParameter(
             &RegAccess,
             Config->CardId,
             SOUND_REG_INTERRUPT,
-            Config->Interrupt == 2 ? 9 : Config->Interrupt) != ERROR_SUCCESS ||
-        Config->DmaBufferSize != (DWORD)-1 &&
-        DrvSetDeviceIdParameter(
+            Config->Interrupt == 2 ? 9 : Config->Interrupt) != ERROR_SUCCESS)
+            return FALSE;
+    }
+    if (DrvSetDeviceIdParameter(
             &RegAccess,
             Config->CardId,
             SOUND_REG_DMABUFFERSIZE,
             Config->DmaBufferSize) != ERROR_SUCCESS ||
-        Config->SynthType != (DWORD)-1 &&
-        DrvSetDeviceIdParameter(
-            &RegAccess,
-            Config->CardId,
-            SOUND_REG_SYNTH_TYPE,
-            Config->SynthType) != ERROR_SUCCESS ||
-
-        /*
-        **  Initialize the DSP version
-        */
-
-        DrvSetDeviceIdParameter(
-            &RegAccess,
-            Config->CardId,
-            SOUND_REG_DSP_VERSION,
-            INVALID_DSP_VERSION) != ERROR_SUCCESS ||
-
         DrvSetDeviceIdParameter(
             &RegAccess,
             Config->CardId,
             SOUND_REG_LOADTYPE,
-            Config->LoadType != ERROR_SUCCESS)) {
+            Config->LoadType) != ERROR_SUCCESS) {
 
         return FALSE;
     } else {
@@ -618,42 +541,15 @@ VOID SetItem(HWND hDlg, UINT Combo, DWORD Value, DWORD Current)
         return;
     }
     if (Value == (DWORD)-1) {
-        LoadString(ghModule, IDS_DISABLED, String, sizeof(String) / sizeof(String[0]));
+        LoadString(hDriverModule1, IDS_DISABLED, String, sizeof(String) / sizeof(String[0]));
     } else {
-        wsprintf(String, Combo == IDD_IRQCB ? TEXT("%d") : TEXT("%X"), Value);
+        wsprintf(String, Combo == IDD_IRQCB ? TEXT("%d") : TEXT("%d"), Value);
     }
     Index = ComboBox_AddString(hwndCombo, String);
     if (Value == Current || Index == 0) {
         ComboBox_SetCurSel(hwndCombo, Index);
     }
     ComboBox_SetItemData(hwndCombo, Index, Value);
-}
-
-BOOL PortItem(HWND hDlg, UINT Combo, DWORD Value, LPDWORD Current)
-{
-    SetItem(hDlg, Combo, Value, *Current);
-    return TRUE;
-}
-BOOL DMAItem(HWND hDlg, UINT Combo, DWORD Value, LPDWORD Current)
-{
-    if (*Current != (DWORD)-1 && (DmaChannelsInUse & (1 << *Current))) {
-        if (Value != (DWORD)-1 && !(DmaChannelsInUse & (1 << Value))) {
-            *Current = Value;
-        }
-    }
-    SetItem(hDlg, Combo, Value, *Current);
-    return TRUE;
-}
-
-BOOL InterruptItem(HWND hDlg, UINT Combo, DWORD Value, LPDWORD Current)
-{
-    if (InterruptsInUse & (1 << *Current)) {
-        if (!(InterruptsInUse & (1 << Value))) {
-            *Current = Value;
-        }
-    }
-    SetItem(hDlg, Combo, Value, *Current);
-    return TRUE;
 }
 
 DWORD GetCurrentValue(HWND hDlg, UINT Combo)
@@ -677,7 +573,7 @@ DWORD GetCurrentValue(HWND hDlg, UINT Combo)
 */
 
 BOOL
-SetCurrentConfig(HWND hDlg, UINT CardId, PSB_CONFIG Config)
+SetCurrentConfig(HWND hDlg, UINT CardId, PES_CONFIG Config)
 {
     Config->CardId = CardId;
 
@@ -685,31 +581,9 @@ SetCurrentConfig(HWND hDlg, UINT CardId, PSB_CONFIG Config)
     **  Get the new configuration which the user entered
     */
 
-    Config->Port         = GetCurrentValue(hDlg, IDD_IOADDRESSCB);
-    if (Config->Port == (DWORD)-1) {
-        Config->Port = SOUND_DEF_PORT;
-    }
-    Config->LoadType     = DSPVersion == INVALID_DSP_VERSION ?
-                                           SOUND_LOADTYPE_CONFIG :
-                                           SOUND_LOADTYPE_NORMAL;
-
-    Config->MPU401Port   = GetCurrentValue(hDlg, IDD_MPU401IOADDRESSCB);
+    Config->LoadType     = SOUND_LOADTYPE_NORMAL;
+    Config->CardId       = CardId;
     Config->Interrupt    = GetCurrentValue(hDlg, IDD_IRQCB);
-    if (Config->Interrupt == (DWORD)-1) {
-        Config->Interrupt = SOUND_DEF_INT;
-    } else
-    if (Config->Interrupt == 2) {
-        Config->Interrupt = 9;
-    }
-    Config->DmaChannel   = GetCurrentValue(hDlg, IDD_DMACB);
-    if (Config->DmaChannel == (DWORD)-1) {
-        Config->DmaChannel = SOUND_DEF_DMACHANNEL;
-    }
-    Config->DmaChannel16 = GetCurrentValue(hDlg, IDD_DMA16CB);
-    Config->DmaBufferSize = (DWORD)GetWindowLong(hDlg, DWL_USER);
-    if (Config->DmaBufferSize == (DWORD)-1) {
-        Config->DmaBufferSize = DefaultDmaBufferSize(DSPVersion);
-    }
 
     /*
     **  Write it to the registry for the driver
@@ -726,6 +600,8 @@ SetCurrentConfig(HWND hDlg, UINT CardId, PSB_CONFIG Config)
 
 BOOL SetupDialog(HWND hDlg, UINT CardId )
 {
+    DWORD i;
+    
     GetDriverConfig(CardId, &Configuration);
 
 
@@ -733,93 +609,28 @@ BOOL SetupDialog(HWND hDlg, UINT CardId )
     ** First reset the combo boxes contents
     */
     ComboBox_ResetContent( GetDlgItem(hDlg, IDD_IOADDRESSCB));
+    ComboBox_ResetContent( GetDlgItem(hDlg, IDD_IRQCB));
 
     /*
     **  Fill our combo boxes
     */
-    if (Configuration.Port == (DWORD)-1) {
-        Configuration.Port = SOUND_DEF_PORT; // 0x220
-    }
-
-    PortItem(hDlg, IDD_IOADDRESSCB, 0x210, &Configuration.Port);
-    PortItem(hDlg, IDD_IOADDRESSCB, 0x220, &Configuration.Port);
-    PortItem(hDlg, IDD_IOADDRESSCB, 0x230, &Configuration.Port);
-    PortItem(hDlg, IDD_IOADDRESSCB, 0x240, &Configuration.Port);
-    PortItem(hDlg, IDD_IOADDRESSCB, 0x250, &Configuration.Port);
-    PortItem(hDlg, IDD_IOADDRESSCB, 0x260, &Configuration.Port);
-    PortItem(hDlg, IDD_IOADDRESSCB, 0x270, &Configuration.Port);
-    PortItem(hDlg, IDD_IOADDRESSCB, 0x280, &Configuration.Port);
-
-    {
-        TCHAR szPort[10];
-        wsprintf(szPort, TEXT("%X"), Configuration.Port);
-        SetWindowText(GetDlgItem(hDlg, IDD_IOADDRESSCB_S), szPort);
-    }
-
     if (Configuration.Interrupt == (DWORD)-1) {
         Configuration.Interrupt = SOUND_DEF_INT;  //7
     }
+    
+    for (i = 0; i < sizeof(IrqChoices) / sizeof(IrqChoices[0]); i++)
+        SetItem(hDlg, IDD_IRQCB, IrqChoices[i], Configuration.Interrupt);
 
-    ComboBox_ResetContent( GetDlgItem(hDlg, IDD_IRQCB));
-    InterruptItem(hDlg, IDD_IRQCB, 0x02, &Configuration.Interrupt);
-    if (DSPVersion < 0x0300) {
-        InterruptItem(hDlg, IDD_IRQCB, 0x03, &Configuration.Interrupt);
-    }
-    InterruptItem(hDlg, IDD_IRQCB, 0x05, &Configuration.Interrupt);
-    InterruptItem(hDlg, IDD_IRQCB, 0x07, &Configuration.Interrupt);
-    if (DSPVersion >= 0x0300) {
-	InterruptItem(hDlg, IDD_IRQCB, 0x0A, &Configuration.Interrupt);
-    }
-
-    if (Configuration.DmaChannel == (DWORD)-1) {
-        Configuration.DmaChannel = 1;
-    }
-
-
-    ComboBox_ResetContent( GetDlgItem(hDlg, IDD_DMACB));
-    DMAItem(hDlg, IDD_DMACB, 0x00, &Configuration.DmaChannel);
-    DMAItem(hDlg, IDD_DMACB, 0x01, &Configuration.DmaChannel);
-    DMAItem(hDlg, IDD_DMACB, 0x03, &Configuration.DmaChannel);
-
-
-    ComboBox_ResetContent( GetDlgItem(hDlg, IDD_DMA16CB));
-
-    DMAItem(hDlg, IDD_DMA16CB, 0x05, &Configuration.DmaChannel16);
-    DMAItem(hDlg, IDD_DMA16CB, 0x06, &Configuration.DmaChannel16);
-    DMAItem(hDlg, IDD_DMA16CB, 0x07, &Configuration.DmaChannel16);
-    DMAItem(hDlg, IDD_DMA16CB, (DWORD)-1, &Configuration.DmaChannel16);
-
-    ComboBox_ResetContent( GetDlgItem(hDlg, IDD_MPU401IOADDRESSCB));
-
-    if (Configuration.MPU401Port == (DWORD)-2) {
-        Configuration.MPU401Port = SOUND_DEF_MPU401_PORT;
-    }
-    PortItem(hDlg, IDD_MPU401IOADDRESSCB, 0x300, &Configuration.MPU401Port);
-    PortItem(hDlg, IDD_MPU401IOADDRESSCB, 0x330, &Configuration.MPU401Port);
-    PortItem(hDlg, IDD_MPU401IOADDRESSCB, (DWORD)-1, &Configuration.MPU401Port);
-
-
-    SetWindowLong(hDlg, DWL_USER, (LONG)Configuration.DmaBufferSize);
-
+    
     {
         TCHAR OKString[30];
-        TCHAR IOAddressString[30];
 
-        LoadString(ghModule,
-                   DSPVersion == INVALID_DSP_VERSION ?
-                       IDS_DETECT :
-                       IDS_OK,
+        LoadString(hDriverModule1,
+                   IDS_OK,
                    OKString,
                    sizeof(OKString) / sizeof(OKString[0]));
-        LoadString(ghModule,
-                   DSPVersion == INVALID_DSP_VERSION ?
-                       IDS_PORT_ADDRESS_SELECT :
-                       IDS_PORT_ADDRESS,
-                   IOAddressString,
-                   sizeof(IOAddressString) / sizeof(IOAddressString[0]));
 
         SetWindowText(GetDlgItem(hDlg, IDOK), OKString);
-        SetWindowText(GetDlgItem(hDlg, IDD_IOADDRESSCB_T), IOAddressString);
     }
     return TRUE;
 }
@@ -856,37 +667,24 @@ BOOL CALLBACK AdvancedDlgProc
     LPARAM          lParam
 )
 {
-/*
-**   The most we'll use for a DMA buffer in the kernel driver is 1/8th of
-**   as second at 176KBytes per second = approx 22K.  For non-16bit
-**   cards the most we'll use is 6K
-*/
+   BOOL fWasted ;
+   int  nDMABufferSize ;
 
-#define MAX_DMA_BUFFER_SIZE (DSPVersion < 0x400 ? 6 : 22)
+#define MAX_DMA_BUFFER_SIZE 64
 
    switch ( uMsg )
    {
       case WM_INITDIALOG:
       {
 
-         LONG BufferSize;
-
-         BufferSize = GetWindowLong(GetParent(hDlg), DWL_USER);
-
-         if (BufferSize == -1L) {
-             BufferSize = DefaultDmaBufferSize(DSPVersion);
-         }
-
          /*
          **  Center the Dialog Box
          */
 
-         SendDlgItemMessage( hDlg, IDD_DMABUFFERSC, UDM_SETRANGE, 0,
-                             MAKELPARAM(MAX_DMA_BUFFER_SIZE, 4) );
          CenterPopup( hDlg, GetParent(hDlg) );
          SetDlgItemInt( hDlg,
                         IDD_DMABUFFEREC,
-                        BufferSize / 0x400,
+                        Configuration.DmaBufferSize / 0x400,
                         FALSE ) ;
       }
       break ;
@@ -906,9 +704,6 @@ BOOL CALLBACK AdvancedDlgProc
 
             case IDOK:
             {
-               BOOL fWasted ;
-               int  nDMABufferSize ;
-
                nDMABufferSize =
                   (DWORD) GetDlgItemInt( hDlg, IDD_DMABUFFEREC,
                                          &fWasted, TRUE );
@@ -921,7 +716,7 @@ BOOL CALLBACK AdvancedDlgProc
                   return ( FALSE ) ;
                }
 
-               SetWindowLong(GetParent(hDlg), DWL_USER, nDMABufferSize * 0x400);
+               Configuration.DmaBufferSize = nDMABufferSize * 0x400;
                EndDialog( hDlg, TRUE ) ;
             }
             break ;
@@ -934,6 +729,33 @@ BOOL CALLBACK AdvancedDlgProc
                break ;
          }
          break ;
+         
+      case WM_VSCROLL:
+         nDMABufferSize =
+            (DWORD) GetDlgItemInt( hDlg, IDD_DMABUFFEREC,
+                                   &fWasted, TRUE );
+         
+         switch ( wParam )
+         {
+            case SB_LINEDOWN:
+            case SB_PAGEDOWN:
+            {
+               if (nDMABufferSize <= 4) nDMABufferSize = 4;
+               else nDMABufferSize--;
+               break;
+            }
+            break ;
+
+            case SB_PAGEUP:
+               if (nDMABufferSize < MAX_DMA_BUFFER_SIZE) nDMABufferSize++;
+               break ;
+
+            default:
+               break ;
+         }
+         
+         SetDlgItemInt( hDlg, IDD_DMABUFFEREC, nDMABufferSize, FALSE);
+         break;
 
       default:
         return FALSE ;
@@ -1033,23 +855,9 @@ Config_OnInitDialog(
         SendDlgItemMessage( hwnd, IDD_HELPTEXT, WM_SETFONT,
                             (WPARAM)g_hDlgFont, 0L );
 
-        SendDlgItemMessage( hwnd, IDD_IOADDRESSCB, WM_SETFONT,
-                            (WPARAM)g_hDlgFont, 0L );
-
-        SendDlgItemMessage( hwnd, IDD_IOADDRESSCB_S, WM_SETFONT,
-                            (WPARAM)g_hDlgFont, 0L );
-
-        SendDlgItemMessage( hwnd, IDD_MPU401IOADDRESSCB, WM_SETFONT,
-                            (WPARAM)g_hDlgFont, 0L );
-
         SendDlgItemMessage( hwnd, IDD_IRQCB, WM_SETFONT,
                             (WPARAM)g_hDlgFont, 0L );
 
-        SendDlgItemMessage( hwnd, IDD_DMACB, WM_SETFONT,
-                            (WPARAM)g_hDlgFont, 0L );
-
-        SendDlgItemMessage( hwnd, IDD_DMA16CB, WM_SETFONT,
-                            (WPARAM)g_hDlgFont, 0L );
     }
 
 
@@ -1085,31 +893,7 @@ Config_OnInitDialog(
     {
         HWND    hwndCombo;
 
-        hwndCombo = GetDlgItem( hwnd, IDD_IOADDRESSCB );
-        if (hwndCombo) {
-            OldComboProc = SubclassWindow( hwndCombo,
-                                           ComboBoxSubClassProc );
-        }
-
-        hwndCombo = GetDlgItem( hwnd, IDD_MPU401IOADDRESSCB );
-        if (hwndCombo) {
-            OldComboProc = SubclassWindow( hwndCombo,
-                                           ComboBoxSubClassProc );
-        }
-
         hwndCombo = GetDlgItem( hwnd, IDD_IRQCB );
-        if (hwndCombo) {
-            OldComboProc = SubclassWindow( hwndCombo,
-                                           ComboBoxSubClassProc );
-        }
-
-        hwndCombo = GetDlgItem( hwnd, IDD_DMACB );
-        if (hwndCombo) {
-            OldComboProc = SubclassWindow( hwndCombo,
-                                           ComboBoxSubClassProc );
-        }
-
-        hwndCombo = GetDlgItem( hwnd, IDD_DMA16CB );
         if (hwndCombo) {
             OldComboProc = SubclassWindow( hwndCombo,
                                            ComboBoxSubClassProc );
@@ -1167,12 +951,6 @@ Config_OnCommand(
         if ( DRVCNF_CONTINUE != ConfigReturn) {
             EndDialog( hwnd, ConfigReturn );
         } else {
-            DSPVersion = INVALID_DSP_VERSION;
-            DrvQueryDeviceIdParameter( &RegAccess,
-                                       CurrentCard,
-                                       SOUND_REG_DSP_VERSION,
-                                       &DSPVersion );
-
             ResizeDialog( hwnd );
             SetDialogTitle( hwnd );
 
@@ -1196,16 +974,10 @@ Config_OnCommand(
 
 
     case IDD_ADVANCEDBTN:
-        {
-            HINSTANCE hLib = LoadLibrary( TEXT("comctl32.dll") );
-            if (hLib) {
-                DialogBox(hInstance,
-                          MAKEINTRESOURCE(DLG_ADVANCED),
-                          hwnd,
-                          (DLGPROC)AdvancedDlgProc);
-                FreeLibrary( hLib);
-            }
-        }
+        DialogBox(hInstance,
+                  MAKEINTRESOURCE(DLG_ADVANCED),
+                  hwnd,
+                  (DLGPROC)AdvancedDlgProc);
         break;
     }
 }
@@ -1225,14 +997,7 @@ Config_OnCommand(
  **************************************************************************/
 int Configure(HWND hDlg)
 {
-    BOOL      ConfigLoad;
     BOOL      Success;
-
-    /*
-     *  We have a new config - Configure the driver for this configuration
-     */
-
-    ConfigLoad = DSPVersion == INVALID_DSP_VERSION;
 
     /*
     **  Make sure the current settings are in the registry
@@ -1263,7 +1028,6 @@ int Configure(HWND hDlg)
         DWORD DriverLoadStatus;
         BOOL  ErrorFound;
         DWORD ErrorStringId;
-        DWORD OldDSPVersion;
 
 
         /*
@@ -1296,13 +1060,7 @@ int Configure(HWND hDlg)
         if (ErrorFound) {
             CurrentCard = CardId;
         } else {
-            /*
-            **  Might have been a config load
-            */
-
-            if (ConfigLoad) {
-                return DRVCNF_CONTINUE;
-            }
+            return DRVCNF_CONTINUE;
         }
 
         /*
@@ -1334,17 +1092,6 @@ int Configure(HWND hDlg)
 
         ConfigErrorMsgBox(hDlg, ErrorStringId);
 
-        /*
-        **  Check to see if the DSP version has changed
-        */
-
-        DSPVersion = INVALID_DSP_VERSION;
-        DrvQueryDeviceIdParameter(
-            &RegAccess,
-            CurrentCard,
-            SOUND_REG_DSP_VERSION,
-            &DSPVersion);
-
         return DRVCNF_CONTINUE;
     } else {
 
@@ -1358,40 +1105,11 @@ int Configure(HWND hDlg)
             return DRVCNF_CONTINUE;
         }
 
-        /*
-        **  Check for Thunderboard and DMA buffer
-        */
-
-        NewBufferSize = Configuration.DmaBufferSize;
-
-        DrvQueryDeviceIdParameter(
-            &RegAccess,
-            Configuration.CardId,
-            SOUND_REG_REALBUFFERSIZE,
-            &NewBufferSize);
-
-        if (NewBufferSize / 0x400 != Configuration.DmaBufferSize / 0x400) {
-            ConfigErrorMsgBox(hDlg,
-                              IDS_CHANGEDDMABUFFERSIZE,
-                              Configuration.DmaBufferSize / 0x400,
-                              NewBufferSize / 0x400);
-        }
-
         if (bInstall) {
             /*
             **  Set up midi mapper
             */
-            DrvQueryDeviceIdParameter(
-                &RegAccess,
-                Configuration.CardId,
-                SOUND_REG_SYNTH_TYPE,
-                &Configuration.SynthType);
-
-
-            if (Configuration.SynthType != (DWORD)-1) {
-                DrvSetMapperName(Configuration.SynthType == SOUND_SYNTH_TYPE_OPL3 ?
-                                 SNDBLST_MAPPER_OPL3 : SNDBLST_MAPPER_ADLIB);
-            }
+            Setupmidimapper();
 
             /*
             **  Reset the Install Flag
@@ -1421,7 +1139,7 @@ int About( HWND hWnd )
 {
     return TRUE;
 #if 0
-    return DialogBox(ghModule,
+    return DialogBox(hDriverModule1,
                      MAKEINTRESOURCE(DLG_ABOUT),
                      hWnd,
                      (DLGPROC) AboutDlgProc );
@@ -1527,7 +1245,7 @@ void cdecl ConfigErrorMsgBox(HWND hDlg, UINT StringId, ...)
     TCHAR   szErrorString[256];
     va_list va;
 
-    LoadString( ghModule,
+    LoadString( hDriverModule1,
                 StringId,
                 szErrorString,
                 sizeof(szErrorString) / sizeof(TCHAR));
@@ -1613,26 +1331,6 @@ PrintHelpText(
     HWND hwnd
     )
 {
-    HWND    hwndParent = GetParent( hwnd );
-    UINT    uID = GetWindowLong( hwnd, GWL_ID );
-    TCHAR   szBuffer[IDS_MAX_HELP_SIZE];
-
-    /*
-    **  Hack to special case the OK button when it's detect
-    */
-    LoadString( ghModule,
-                IDS_HELP_BASE + uID + VersionToDlgId(DSPVersion),
-                szBuffer, IDS_MAX_HELP_SIZE );
-    SetDlgItemText( hwndParent, IDD_HELPTEXT, szBuffer );
-
-    if (DSPVersion == INVALID_DSP_VERSION && uID == IDOK) {
-        LoadString( ghModule, IDS_FRM_DETECTBTN,
-                    szBuffer, IDS_MAX_HELP_SIZE );
-    } else {
-        LoadString( ghModule, IDS_HELP_FRM_BASE + uID,
-                    szBuffer, IDS_MAX_HELP_SIZE );
-    }
-    SetDlgItemText( hwndParent, IDD_HELPTEXTFRAME, szBuffer );
 }
 
 
@@ -1658,7 +1356,7 @@ ResizeDialog(
     HWND hwnd
     )
 {
-    POINT   ptNewPos[3];
+    POINT   ptNewPos;
     HDWP    hdwp;
     LONG    lDecrement;
 
@@ -1670,118 +1368,21 @@ ResizeDialog(
     ** adjustments show/hide the necessary controls.
     */
 
-    ptNewPos[0].x = g_OrgRectDlg.right - g_OrgRectDlg.left;
-    ptNewPos[0].y = g_OrgRectDlg.bottom - g_OrgRectDlg.top;
+    ptNewPos.x = g_OrgRectDlg.right - g_OrgRectDlg.left;
+    ptNewPos.y = g_OrgRectDlg.bottom - g_OrgRectDlg.top;
 
-    ptNewPos[1].x = g_OrgRect[IDD_HELPTEXTFRAME - IDD_DLG_BASE].left;
-    ptNewPos[1].y = g_OrgRect[IDD_HELPTEXTFRAME - IDD_DLG_BASE].top;
-
-    ptNewPos[2].x = g_OrgRect[IDD_HELPTEXT - IDD_DLG_BASE].left;
-    ptNewPos[2].y = g_OrgRect[IDD_HELPTEXT - IDD_DLG_BASE].top;
-
-    switch (VersionToDlgId(DSPVersion)) {
-
-    case DLG_SB16CONFIG:
-        MyShowWindow( GetDlgItem( hwnd, IDD_IOADDRESSCB_S ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IOADDRESSCB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMA16CB ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMA16CB_T ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_MPU401IOADDRESSCB ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_MPU401IOADDRESSCB_T ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMACB ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMACB_T ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IRQCB ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IRQCB_T ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_ADVANCEDBTN ), SW_SHOW );
-        lDecrement = 0L;
-        break;
-
-    case DLG_SBPROCONFIG:
-        MyShowWindow( GetDlgItem( hwnd, IDD_IOADDRESSCB_S ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IOADDRESSCB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMA16CB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMA16CB_T ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_MPU401IOADDRESSCB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_MPU401IOADDRESSCB_T ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMACB ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMACB_T ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IRQCB ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IRQCB_T ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_ADVANCEDBTN ), SW_SHOW );
-        lDecrement = (g_OrgRect[IDD_HELPTEXTFRAME - IDD_DLG_BASE].top -
-                      g_OrgRect[IDD_DMA16CB - IDD_DLG_BASE].top);
-        break;
-
-    case DLG_SB1CONFIG:
-        MyShowWindow( GetDlgItem( hwnd, IDD_IOADDRESSCB_S ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IOADDRESSCB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMA16CB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMA16CB_T ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_MPU401IOADDRESSCB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_MPU401IOADDRESSCB_T ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMACB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMACB_T ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IRQCB ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IRQCB_T ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_ADVANCEDBTN ), SW_HIDE );
-        lDecrement = (g_OrgRect[IDD_HELPTEXTFRAME - IDD_DLG_BASE].top -
-                      g_OrgRect[IDD_DMACB - IDD_DLG_BASE].top);
-        break;
-
-    case DLG_PORTSELECT:
-        MyShowWindow( GetDlgItem( hwnd, IDD_IOADDRESSCB_S ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IOADDRESSCB ), SW_SHOW );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMA16CB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMA16CB_T ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_MPU401IOADDRESSCB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_MPU401IOADDRESSCB_T ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMACB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_DMACB_T ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IRQCB ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_IRQCB_T ), SW_HIDE );
-        MyShowWindow( GetDlgItem( hwnd, IDD_ADVANCEDBTN ), SW_HIDE );
-        lDecrement = (g_OrgRect[IDD_HELPTEXTFRAME - IDD_DLG_BASE].top -
-                      g_OrgRect[IDD_DMACB - IDD_DLG_BASE].top);
-        break;
-    }
-
-
-    ptNewPos[0].y -= lDecrement;
-    ptNewPos[1].y -= lDecrement;
-    ptNewPos[2].y -= lDecrement;
-
-
+    MyShowWindow( GetDlgItem( hwnd, IDD_IRQCB ), SW_SHOW );
+    MyShowWindow( GetDlgItem( hwnd, IDD_IRQCB_T ), SW_SHOW );
+    MyShowWindow( GetDlgItem( hwnd, IDD_ADVANCEDBTN ), SW_HIDE );
 
     /*
-    ** First resize the dialog box.
+    ** Resize the dialog box.
     */
-    SetWindowPos( hwnd, HWND_TOP, 0, 0, ptNewPos[0].x, ptNewPos[0].y,
+    SetWindowPos( hwnd, HWND_TOP, 0, 0, ptNewPos.x, ptNewPos.y -
+                  g_OrgRect[(IDD_DLG_BASE - IDD_HELPTEXTFRAME)].bottom +
+                  g_OrgRect[(IDD_DLG_BASE - IDD_HELPTEXTFRAME)].top - 40,
                   SWP_NOMOVE | SWP_NOZORDER );
 
-
-    /*
-    ** Now move the help text controls
-    */
-
-    hdwp = BeginDeferWindowPos( 2 );
-
-    hdwp = DeferWindowPos( hdwp,
-                           GetDlgItem( hwnd, IDD_HELPTEXTFRAME ),
-                           HWND_TOP,
-                           ptNewPos[1].x,
-                           ptNewPos[1].y,
-                           0, 0,
-                           SWP_NOSIZE | SWP_NOZORDER );
-
-    hdwp = DeferWindowPos( hdwp,
-                           GetDlgItem( hwnd, IDD_HELPTEXT ),
-                           HWND_TOP,
-                           ptNewPos[2].x,
-                           ptNewPos[2].y,
-                           0, 0,
-                           SWP_NOSIZE | SWP_NOZORDER );
-
-    EndDeferWindowPos( hdwp );
 }
 
 
@@ -1803,7 +1404,7 @@ SetDialogTitle(
 {
     TCHAR   szTitle[80];
 
-    LoadString( ghModule, VersionToDlgId(DSPVersion) + IDS_DIALOG_BASE, szTitle, 80 );
+    LoadString( hDriverModule1, IDS_ESSCONFIG + IDS_DIALOG_BASE, szTitle, 80 );
     SetWindowText( hwnd, szTitle );
 }
 
@@ -1837,354 +1438,167 @@ GetOriginalControlPositions(
 
 }
 
-//------------------------------------------------------------------------
-//  DWORD InstallPnPDevice
-//
-//  Description:
-//    This routine performs the installation of a PnP ISA device.
-//    This involves the following steps:
-//    1.  Create a subkey under the sndblst driver's Parameters key, and
-//        set it up just as if it was a manually-installed port.
-//    2.  Display the resource selection dialog, and allow the user to
-//        configure the settings for the device.
-//    3.  Write out the settings to the registry key in legacy format
-//    4.  Write out PnPDeviceId value to the key, which gives
-//        the device instance name with which this device is associated.
-//
-//  Parameters:
-//      DeviceInfoSet - Supplies a handle to the device information
-//      set containing the device being installed.
-//
-//      DeviceInfoData - Supplies the address of the device information
-//      element being installed.
-//
-//  Return Value:
-//      If successful, the return value is NO_ERROR, otherwise it is
-//      a Win32 error code.
-//
-//------------------------------------------------------------------------
-DWORD
-InstallPnPDevice(
-    IN HDEVINFO         DeviceInfoSet,
-    IN PSP_DEVINFO_DATA DeviceInfoData
-    )
+ 
+ 
+/* Get line from config file */
+static int getline(int fd, char *pszBuffer, int len)
 {
-    HWND                    hwndParent;
-    DWORD                   Err;
-    SP_DEVINSTALL_PARAMS    DeviceInstallParams;
-    TCHAR                   CharBuffer[MAX_PATH];
-
-    CurrentCard   = 0;
-
-
-    //
-    // Retrieve the device install parameters, and set the DI_NEEDREBOOT flag.  If this
-    // fails, it's no big deal, as the device installer should be able to figure it out
-    // on its own.  (Also, retrieve the parent window handle for resource selection UI.)
-    //
-    DeviceInstallParams.cbSize = sizeof(SP_DEVINSTALL_PARAMS);
-    if(DLSetupDiGetDeviceInstallParams(DeviceInfoSet, DeviceInfoData, &DeviceInstallParams)) {
-        hwndParent = DeviceInstallParams.hwndParent;
-        DeviceInstallParams.Flags |= DI_NEEDREBOOT;
-        DLSetupDiSetDeviceInstallParams(DeviceInfoSet, DeviceInfoData, &DeviceInstallParams);
-    } else {
-        hwndParent = NULL;
+    int i;
+    BOOL fComment = FALSE;
+    char c = 0;
+    
+    for (i = 0, len -= 2; i < len; i++)
+    {
+        if (!_lread(fd, &c, 1) || c == '\n')
+            break;
+        if (c == ';') fComment=TRUE;
+        if (!fComment) pszBuffer[i++] = c;
     }
-
-    DrvNumberOfDevices(&RegAccess, &NumberOfCards);
-    if (NumberOfCards == 0) {
-        HKEY hKey;
-        hKey = DrvCreateDeviceKey(RegAccess.DriverName);
-        RegCloseKey(hKey);
-
-        DrvNumberOfDevices(&RegAccess, &NumberOfCards);
-
-        if (NumberOfCards == 0) {
-            ConfigErrorMsgBox(hwndParent, IDS_ERROR_UNKNOWN);
-            return DRVCNF_CANCEL;
-        }
+    if (c == '\n')
+    {
+        if (fComment) pszBuffer[i++] = '\r';
+        pszBuffer[i++] = '\n';
     }
-
-    if(!DoPnPDialog(DeviceInfoSet, DeviceInfoData, hwndParent)) {
-        Err = GetLastError();
-        goto RegistryError;
-    }
-
-    //
-    // Set "PnPDevice" entry
-    //
-    DLSetupDiGetDeviceInstanceId(DeviceInfoSet,
-                               DeviceInfoData,
-                               CharBuffer,
-                               sizeof(CharBuffer) / sizeof(TCHAR),
-                               NULL);
-
-    if (ERROR_SUCCESS != SndblstSetDeviceIdStringParameter(&RegAccess,
-                                              CurrentCard,
-                                              SOUND_REG_PNPDEVICE,
-                                              (LPTSTR)CharBuffer,
-                                              ByteCountOf(lstrlen(CharBuffer) + 1))) {
-        Err = GetLastError();
-        goto RegistryError;
-    }
-
-    if (ERROR_SUCCESS != DrvSetDeviceIdParameter(
-                                    &RegAccess,
-                                    CurrentCard,
-                                    SOUND_REG_DSP_VERSION,
-                                    INVALID_DSP_VERSION )) {
-        Err = GetLastError();
-        goto RegistryError;
-    }
-
-    return DRVCNF_OK;
-
-
-RegistryError:
-    //
-    // Clean up the device instance.  
-    //
-    // Disable the device if the error wasn't a user cancel.
-    //
-    if(Err != ERROR_CANCELLED) {
-
-        DWORD ConfigFlags;
-        SP_DRVINFO_DATA DriverInfoData;
-
-        //
-        // The device is in an unknown state.  Disable it by setting the
-        // CONFIGFLAG_DISABLED config flag.
-        //
-        if(!DLSetupDiGetDeviceRegistryProperty(DeviceInfoSet,
-                                             DeviceInfoData,
-                                             SPDRP_CONFIGFLAGS,
-                                             NULL,
-                                             (PBYTE)&ConfigFlags,
-                                             sizeof(ConfigFlags),
-                                             NULL))
-        {
-            //
-            // Couldn't retrieve ConfigFlags--default to zero.
-            //
-            ConfigFlags = 0;
-        }
-
-        ConfigFlags |= (CONFIGFLAG_DISABLED | CONFIGFLAG_REINSTALL);
-
-        DLSetupDiSetDeviceRegistryProperty(DeviceInfoSet,
-                                         DeviceInfoData,
-                                         SPDRP_CONFIGFLAGS,
-                                         (PBYTE)&ConfigFlags,
-                                         sizeof(ConfigFlags)
-                                        );
-
-        //
-        // Delete the Driver= entry from the Dev Reg Key and delete the
-        // DrvRegKey
-        //
-        DriverInfoData.cbSize = sizeof(SP_DRVINFO_DATA);
-        if(DLSetupDiGetSelectedDriver(DeviceInfoSet, DeviceInfoData, &DriverInfoData)) {
-
-            DLSetupDiDeleteDevRegKey(DeviceInfoSet,
-                                   DeviceInfoData,
-                                   DICS_FLAG_GLOBAL | DICS_FLAG_CONFIGGENERAL,
-                                   0,
-                                   DIREG_DRV
-                                  );
-
-            DLSetupDiSetDeviceRegistryProperty(DeviceInfoSet,
-                                             DeviceInfoData,
-                                             SPDRP_DRIVER,
-                                             NULL,
-                                             0
-                                            );
-        }
-    }
-
-    DrvRemoveDriver(&RegAccess);
-
-    return DRVCNF_CANCEL;
-
-} // InstallPnPDevice
-
-BOOL
-CALLBACK
-AddPropSheetPageProc(
-    IN HPROPSHEETPAGE hpage,
-    IN LPARAM lParam
-   )
-{
-    *((HPROPSHEETPAGE *)lParam) = hpage;
-    return TRUE;
+    pszBuffer[i] = 0;
+    return i;
 }
 
-//------------------------------------------------------------------------
-//  INT DoPnPDialog
-//
-//  Description:
-//      This routine displays the configuration property sheet for a
-//      PnP ISA sndblst device.
-//
-//  Parameters:
-//      DeviceInfoSet - Supplies a handle to the device information
-//      set containing the device being installed.
-//
-//      DeviceInfoData - Supplies the address of the device information
-//      element being installed.
-//
-//      hwndParent - supplies the handle of the window to be used as the
-//      parent for the configuration UI.
-//
-//  Return Value:
-//      If success (i.e., if the user changed something), the return value is 1.
-//      If failure, the return value is 0, and GetLastError() returns the cause.
-//
-//------------------------------------------------------------------------
-INT
-DoPnPDialog(
-    IN  HDEVINFO         DeviceInfoSet,
-    IN  PSP_DEVINFO_DATA DeviceInfoData,
-    IN  HWND             hwndParent
-    )
+#define CfgIsKey(Name) (lstrcmpiA(Token,Name) == 0 && (Token = Token + sizeof(Name) - 1))
+#define CfgSetDeviceParameter(Name,Value) \
+    DrvSetDeviceIdParameter(&RegAccess, CurrentCard, Name, Value)
+
+#define CfgSetDeviceParamInt(Destination,Name) \
+    CfgSetDeviceParameter(Name,(Destination=atoi(Token)))
+#define CfgSetDeviceParamHex(Destination,Name) \
+    CfgSetDeviceParameter(Name,(Destination=strtol(Token,&endptr,16)))
+
+
+void ReadConfigini(BOOL ParseOptions)
 {
-    DWORD                       Err;
-    SB_CONFIG                   InitConfig;
-    SB_CONFIG                   PnPConfig;
-    HPROPSHEETPAGE              hPage;
-    FARPROC                     PropSheetExtProc;
-    INT                         PropSheetReturn;
-    HINSTANCE                   hLib;
-    SP_PROPSHEETPAGE_REQUEST    PropPageRequest;
-    PROPSHEETHEADER             PropHeader;
-    PROPSHEETPAGE               PropPage;
-    TCHAR                       CharBuffer[MAX_PATH];
-    SP_DEVINSTALL_PARAMS        DeviceInstallParams;
-    LOG_CONF                    ForcedLogConf;
-    BOOL                        DisplayPropSheet = TRUE;
-
-
-    //
-    // Retrieve the current settings for this device, so we'll know whether they changed.
-    //
-    GetDriverConfig(CurrentCard, &InitConfig);
-
-    //
-    // We don't want to popup the configuration UI if the 'quiet install' flag is
-    // set _and_ we already have a forced config (pre-install support).
-    //
-    if(DLCM_Get_First_Log_Conf(&ForcedLogConf, DeviceInfoData->DevInst, FORCED_LOG_CONF) == CR_SUCCESS) {
-
-        DLCM_Free_Log_Conf_Handle(ForcedLogConf);
-
-        DeviceInstallParams.cbSize = sizeof(SP_DEVINSTALL_PARAMS);
-        if(DLSetupDiGetDeviceInstallParams(DeviceInfoSet, DeviceInfoData, &DeviceInstallParams)) {
-            if(DeviceInstallParams.Flags & DI_QUIETINSTALL) {
-                DisplayPropSheet = FALSE;
+    static BOOL HasBeenHere = FALSE;
+    BOOLEAN SaveIrqChoices = FALSE, Verbose = FALSE;
+    char *endptr, SystemPath[MAX_PATH], Line[130], *Token;
+    DWORD IrqIdx = 0;
+    int fd, Len, LangId;
+    long val;
+    
+    if (HasBeenHere) return;
+    HasBeenHere = TRUE;
+    
+    GetSystemDirectoryA(SystemPath, sizeof(SystemPath));
+    lstrcatA(SystemPath, "\\config.ini");
+    
+	fd  = _lopen(SystemPath, OF_READ);
+	if (fd != -1)
+    {
+        while (Len = getline(fd, Line, sizeof(Line)))
+        {
+            if (Token = strtok(Line, "="))
+            {
+                LangId = atoi(Token);
+                if (LangId < 100 || LangId > 221)
+                {
+                    if (ParseOptions)
+                    {
+                        if (CfgIsKey("es938installed"))
+                            CfgSetDeviceParameter(TEXT("ES938"), (SOUND_DEF_ES938 = atoi(Token)));
+                        else if (CfgIsKey("EnableAutoInstall"))
+                            SOUND_DEF_ENABLE_AUTO_INSTALL = atoi(Token);
+                        else if (CfgIsKey("DisableMicGain"))
+                            CfgSetDeviceParamInt(SOUND_DEF_DISABLE_MICGAIN, SOUND_REG_DISABLE_MICGAIN);
+                        else if (CfgIsKey("MutePhone"))
+                            CfgSetDeviceParamInt(SOUND_DEF_MUTE_PHONE, SOUND_REG_MUTE_PHONE);
+                        else if (CfgIsKey("2WireExtHwVol"))
+                            CfgSetDeviceParamInt(SOUND_DEF_2WIRES_EXTHWVOL, SOUND_REG_2WIRES_EXTHWVOL);
+                        else if (CfgIsKey("SingleTransferDMA"))
+                            CfgSetDeviceParamInt(SOUND_DEF_SINGLE_TX_DMA, SOUND_REG_SINGLE_TX_DMA);
+                        else if (CfgIsKey("3D-Limit"))
+                            CfgSetDeviceParamInt(SOUND_DEF_3D_LIMIT, SOUND_REG_3D_LIMIT);
+                        else if (CfgIsKey("SpatializerEnable"))
+                            CfgSetDeviceParamInt(SOUND_DEF_SPATIALIZER_ENABLE, SOUND_REG_SPATIALIZER_ENABLE);
+                        else if (CfgIsKey("New_Laptop.Sys"))
+                             CfgSetDeviceParamInt(SOUND_DEF_NEW_LAPTOP_SYS, SOUND_REG_NEW_LAPTOP_SYS);
+                        else if (CfgIsKey("defaultExtMidi"))
+                             CfgSetDeviceParamInt(SOUND_DEF_DEFAULT_EXT_MIDI, SOUND_REG_DEFAULT_EXT_MIDI);
+                        else if (CfgIsKey("DisableAuxB"))
+                             CfgSetDeviceParamInt(SOUND_DEF_DISABLE_AUXB, SOUND_REG_DISABLE_AUXB);
+                        else if (CfgIsKey("RecordMonitorMode"))
+                            CfgSetDeviceParamInt(SOUND_DEF_RECORD_MONITOR_MODE, SOUND_REG_RECORD_MONITOR_MODE);
+                        else if (CfgIsKey("EnableIIS"))
+                            CfgSetDeviceParamInt(SOUND_DEF_ENABLE_IIS, SOUND_REG_ENABLE_IIS);
+                        else if (CfgIsKey("enableMPU401"))
+                            CfgSetDeviceParamInt(SOUND_DEF_ENABLE_MPU401, SOUND_REG_ENABLE_MPU401);
+                        else if (CfgIsKey("SoftexAPM"))
+                        {
+                            CfgSetDeviceParameter(SOUND_REG_SOFTEXAPM,(val=atoi(Token)));
+                            if (val) AddEssAPMEntry();
+                        }
+                        else if (CfgIsKey("DefaultMasterVol"))
+                            CfgSetDeviceParamHex(val, SOUND_REG_DEFAULT_MASTER_VOL);
+                        else if (CfgIsKey("DefaultRecordMicVol"))
+                            CfgSetDeviceParamHex(val, SOUND_REG_DEFAULT_RECORDMIC_VOL);
+                        else if (CfgIsKey("PollingMasterVol"))
+                            CfgSetDeviceParamHex(val, SOUND_REG_POLLINGMASTER_VOL);
+                        else if (CfgIsKey("ReducedDebounceExtHwVol"))
+                            CfgSetDeviceParamHex(val, SOUND_REG_REDUCEDDECBOUNCEEXTHW_VOL);
+                        else if (CfgIsKey("DefaultLineInMute"))
+                            CfgSetDeviceParamHex(val, SOUND_REG_DEFAULT_LINEIN_MUTE);
+                        else if (CfgIsKey("DefaultAuxBMute"))
+                            CfgSetDeviceParamHex(val, SOUND_REG_DEFAULT_AUXB_MUTE);
+                        else if (CfgIsKey("DefaultPCSpkrMute"))
+                            CfgSetDeviceParamHex(val, SOUND_REG_DEFAULT_PCSPKR_MUTE);
+                        else if (CfgIsKey("LoadDriverDuringBoot"))
+                            LoadDriverDuringBoot = atoi(Token);
+                    }
+                    else if (lstrcmpiA(Token, "irqchoices") == 0)
+                    {
+                        memset(&IrqChoices, 0, sizeof(IrqChoices));
+                        for (Token = strtok(NULL, ","); Token; Token = strtok(NULL, ","))
+                            IrqChoices[IrqIdx++] = atoi(Token);
+                        SaveIrqChoices = TRUE;
+                    }
+                    else if (CfgIsKey("defaultirq"))
+                        SOUND_DEF_INT = atoi(Token);
+                }
+                else
+                {
+                    TCHAR tszKey[40], tszValue[40];
+                    unsigned int i;
+                    
+                    // NB: Even though this is prone to  buffer overflows, inefficient, 
+                    // buggy, that's how it  it is done in the original code...
+                    for (i = 0; i < strlen(Token); i++)
+                        tszKey[i] = Token[i];
+                    tszKey[i] = 0;
+                    tszKey[i + 1] = 0;
+                    
+                    Token += 4;
+                    
+                    for (i = 0; i < strlen(Token); i++)
+                        tszValue[i] = Token[i];
+                    tszValue[i] = 0;
+                    tszValue[i + 1] = 0;
+                    
+                    DrvSetOptions(&RegAccess, CurrentCard, tszKey, tszValue);
+                }
             }
         }
-    }
-
-    //
-    // Don't popup the UI if DisplayPropSheet is FALSE.
-    //
-    // Popup the configuration dialog for the user to pick the resources.
-    //
-    if(DisplayPropSheet)
-    {
-
-        //
-        // Now get the resource selection page from setupapi.dll
-        //
-        if(!(hLib = GetModuleHandle(g_szSetupApiDll)) ||
-           !(PropSheetExtProc = GetProcAddress(hLib, "ExtensionPropSheetPageProc"))) {
-
-            Err = GetLastError();
-            goto cleanup;
+	    _lclose(fd);
+        DrvSetDeviceIdParameter(&RegAccess, CurrentCard, SOUND_REG_VERBOSE, Verbose);
+        if ( !ParseOptions )
+        {
+          if ( SaveIrqChoices )
+            DrvSetBinaryValue(&RegAccess, CurrentCard, SOUND_REG_IRQCHOICES, (LPBYTE)IrqChoices, IrqIdx);
         }
-
-        PropPageRequest.cbSize = sizeof(SP_PROPSHEETPAGE_REQUEST);
-        PropPageRequest.PageRequested  = SPPSR_SELECT_DEVICE_RESOURCES;
-        PropPageRequest.DeviceInfoSet  = DeviceInfoSet;
-        PropPageRequest.DeviceInfoData = DeviceInfoData;
-
-        if(!PropSheetExtProc(&PropPageRequest, AddPropSheetPageProc, &hPage)) {
-            Err = ERROR_INVALID_PARAMETER;
-            goto cleanup;
-        }
-
-        //
-        // Create the property sheet.
-        //
-        LoadString(ghModule,
-                   IDS_SB16CONFIG,
-                   CharBuffer,
-                   CharSizeOf(CharBuffer)
-                  );
-
-        PropHeader.dwSize      = sizeof(PROPSHEETHEADER);
-        PropHeader.dwFlags     = PSH_NOAPPLYNOW;
-        PropHeader.hwndParent  = hwndParent;
-        PropHeader.hInstance   = ghModule;
-        PropHeader.pszIcon     = NULL;
-        PropHeader.pszCaption  = CharBuffer;
-        PropHeader.nPages      = 1;
-        PropHeader.phpage      = &hPage;
-        PropHeader.nStartPage  = 0;
-        PropHeader.pfnCallback = NULL;
-
-        if((PropSheetReturn = PropertySheet(&PropHeader)) == -1) {
-            Err = ERROR_INVALID_DATA;
-            goto cleanup;
-        }
-
-        //
-        // Since PropertySheet() was successful, we need to clear the page
-        // handles out of our array, because we don't need to destroy them
-        // anymore.
-        //
-        hPage = NULL;
-
-        if(!PropSheetReturn) {
-            Err = ERROR_CANCELLED;
-            goto cleanup;
-        }
-    }
-
-    //
-    // The user selected resources for this device--retrieve those resources.
-    //
-    if(!GetPnPConfig((DEVINST)(DeviceInfoData->DevInst),
-                               FORCED_LOG_CONF,
-                               &PnPConfig))
-    {
-        Err = ERROR_INVALID_DATA;
-        goto cleanup;
-    }
-
-    //
-    //  We need to write out the settings to the legacy SoundBlaster
-    //  registry location so that when the kernel-mode driver gets
-    //  started it can pick up the user's changed settings.
-    //
-    if (!SBConfigEqual(&InitConfig, &PnPConfig))
-    {
-        SetDriverConfig(&PnPConfig);
-    }
-
-    return 1;
-
-cleanup:
-    if (hPage)
-        DestroyPropertySheetPage(hPage);
-    SetLastError(Err);
-    return 0;
+        DrvSetDeviceIdParameter(&RegAccess, CurrentCard, SOUND_REG_ENABLE_AUTO_INSTALL, SOUND_DEF_ENABLE_AUTO_INSTALL);
+	}
 }
 
 //------------------------------------------------------------------------
-//  BOOL SBConfigEqual
+//  BOOL ESConfigEqual
 //
 //  Description:
-//      Compares SB_CONFIG structures
+//      Compares ES_CONFIG structures
 //
 //  Parameters:
 //      Config1 - First structure to compare to
@@ -2196,313 +1610,49 @@ cleanup:
 //
 //------------------------------------------------------------------------
 BOOL
-SBConfigEqual(
-    IN  PSB_CONFIG Config1,
-    IN  PSB_CONFIG Config2
+ESConfigEqual(
+    IN  PES_CONFIG Config1,
+    IN  PES_CONFIG Config2
     )
 {
 
-    if ((Config1->Port           == Config2->Port) &&
-        (Config1->MPU401Port     == Config2->MPU401Port) && 
-        (Config1->Interrupt      == Config2->Interrupt) &&    
-        (Config1->DmaChannel     == Config2->DmaChannel) && 
-        (Config1->DmaChannel16   == Config2->DmaChannel16) && 
-        (Config1->DmaBufferSize  == Config2->DmaBufferSize) && 
-        (Config1->SynthType      == Config2->SynthType))
+    if ((Config1->Interrupt      == Config2->Interrupt) &&    
+        (Config1->DmaBufferSize  == Config2->DmaBufferSize))
         return TRUE;
     else
         return FALSE;
 }
 
 
-//------------------------------------------------------------------------
-//  BOOL GetPnPConfig
-//
-//  Description:
-//      This routine retrieves the resources picked for the specified
-//      device instance in a particular logconfig.
-//
-//  Parameters:
-//      DevInst - Supplies the handle of a device instance to retrieve configuration for.
-//      
-//      LogConfigType - Specifies the type of logconfig to retrieve.  Must be either
-//      ALLOC_LOG_CONF, BOOT_LOG_CONF, or FORCED_LOG_CONF.
-//      
-//      Configuration - Pointer to the SoundBlaster configuration structure to
-//      be filled in with the user's current settings.
-//
-//  Return Value:
-//      If success, the return value is TRUE, otherwise it is FALSE.
-//
-//------------------------------------------------------------------------
-BOOL
-GetPnPConfig(
-    IN  DEVINST    DevInst,
-    IN  ULONG      LogConfigType,
-    OUT PSB_CONFIG Configuration
-    )
-{
-    LOG_CONF LogConfig;
-    RES_DES ResDes;
-    RES_DES ResDes1;
-    IO_RESOURCE IoResource;
-    DMA_RESOURCE DmaResource;
-    CONFIGRET cr;
-    BOOL Success;
-    IRQ_RESOURCE IrqResource;
+/***************************************************************************
+ *
+ *  Function :
+ *      DrvSetOptions
+ *
+ *  Parameters :
+ *      ServiceNodeKey       Handle to the device services node key
+ *      ValueName            Name of value to set
+ *      Value                REG_SZ value to set
+ *
+ *  Return code :
+ *
+ *      Standard error code (see winerror.h)
+ *
+ *  Description :
+ *
+ *      Add the value to the device parameters section under the
+ *      services node.
+ *      This section is created if it does not already exist.
+ *
+ ***************************************************************************/
 
-    //
-    //  Make sure that we are working with known values if they don't
-    //  get filled in by the CM APIs.
-    //
-    InitConfiguration(Configuration);
-    Configuration->DmaChannel16 = (DWORD)-1;  // Set to disabled by default
-    Configuration->MPU401Port   = (DWORD)-1;  // Set to disabled by default 
-    Configuration->SynthType    = (DWORD)SOUND_SYNTH_TYPE_NONE;  // Set to disabled by default
-
-    if(DLCM_Get_First_Log_Conf(&LogConfig,
-                             DevInst,
-                             LogConfigType) != CR_SUCCESS) {
-        return FALSE;
-    }
-
-    Success = FALSE;    // assume failure.
-
-    //
-    // First, get the Io base ports
-    //
-    ResDes = LogConfig;
-
-    while(DLCM_Get_Next_Res_Des(&ResDes1,
-                           ResDes,
-                           ResType_IO,
-                           NULL,
-                           0) == CR_SUCCESS) {
-
-        cr = DLCM_Get_Res_Des_Data(ResDes1,
-                                 &IoResource,
-                                 sizeof(IoResource),
-                                 0
-                                );
-
-        if (LogConfig != ResDes)
-            DLCM_Free_Res_Des_Handle(ResDes);
-    
-        if(cr != CR_SUCCESS) {
-            goto clean0;
-        }
-    
-        //
-        //  Find the resources assigned to the particular functions that
-        //  they drive on the card.
-        //
-        if (IoResource.IO_Header.IOD_Alloc_Base >= (DWORDLONG)0x210 &&
-            IoResource.IO_Header.IOD_Alloc_Base <= (DWORDLONG)0x280)
-        {
-            Configuration->Port = (DWORD)IoResource.IO_Header.IOD_Alloc_Base;
-        }
-
-        if (IoResource.IO_Header.IOD_Alloc_Base == (DWORDLONG)0x330 ||
-            IoResource.IO_Header.IOD_Alloc_Base == (DWORDLONG)0x300)
-        {
-            Configuration->MPU401Port = (DWORD)IoResource.IO_Header.IOD_Alloc_Base;
-        }
-
-        if (IoResource.IO_Header.IOD_Alloc_Base == (DWORDLONG)0x388)
-        {
-            Configuration->SynthType = SOUND_SYNTH_TYPE_OPL3;
-        }
-
-        ResDes = ResDes1;
-
-    }
-
-    if (LogConfig != ResDes)
-        DLCM_Free_Res_Des_Handle(ResDes);
-
-    //
-    // Next, get the DMA channels.  We can get one or two of these.
-    //
-    ResDes = LogConfig;
-
-    while(DLCM_Get_Next_Res_Des(&ResDes1,
-                           ResDes,
-                           ResType_DMA,
-                           NULL,
-                           0) == CR_SUCCESS) {
-
-        cr = DLCM_Get_Res_Des_Data(ResDes1,
-                                 &DmaResource,
-                                 sizeof(DmaResource),
-                                 0
-                                );
-
-        if (LogConfig != ResDes)
-            DLCM_Free_Res_Des_Handle(ResDes);
-    
-        if(cr != CR_SUCCESS) {
-            goto clean0;
-        }
-    
-        if (DmaResource.DMA_Header.DD_Alloc_Chan >= 0 &&
-            DmaResource.DMA_Header.DD_Alloc_Chan <= 3)
-        {
-            Configuration->DmaChannel = DmaResource.DMA_Header.DD_Alloc_Chan;
-        }
-
-        if (DmaResource.DMA_Header.DD_Alloc_Chan >= 5 &&
-            DmaResource.DMA_Header.DD_Alloc_Chan <= 7)
-        {
-            Configuration->DmaChannel16 = DmaResource.DMA_Header.DD_Alloc_Chan;
-        }
-
-        ResDes = ResDes1;
-    }
-
-    if (LogConfig != ResDes)
-        DLCM_Free_Res_Des_Handle(ResDes);
-
-    //
-    // Now, get the IRQ.  We only need one of these.
-    //
-    if(DLCM_Get_Next_Res_Des(&ResDes,
-                           LogConfig,
-                           ResType_IRQ,
-                           NULL,
-                           0) != CR_SUCCESS) {
-        goto clean0;
-    }
-
-    cr = DLCM_Get_Res_Des_Data(ResDes,
-                             &IrqResource,
-                             sizeof(IrqResource),
-                             0
-                            );
-
-    DLCM_Free_Res_Des_Handle(ResDes);
-
-    if(cr != CR_SUCCESS) {
-        goto clean0;
-    }
-
-    Configuration->Interrupt = IrqResource.IRQ_Header.IRQD_Alloc_Num;
-
-    //
-    //  Now fill in the rest of the config with the correct values for
-    //  the SB16 PnP settings.
-    //
-    Configuration->CardId = CurrentCard;
-    Configuration->DmaBufferSize = 0x4000;
-    Configuration->LoadType = SOUND_LOADTYPE_NORMAL;
-
-    Success = TRUE;
-
-clean0:
-    DLCM_Free_Log_Conf_Handle(LogConfig);
-
-    return Success;
-}
-
-//------------------------------------------------------------------------
-//  HDEVINFO OpenPnPDeviceInstance
-//
-//  Description:
-//      This routine creates a device information set, and opens the specified
-//      device information element within that set.
-//
-//  Parameters:
-//      hwndParent - supplies the handle of the window to be used as the parent for
-//      any UI to be performed for the device information element.
-//      
-//      DeviceInfoData - supplies the address of a SP_DEVINFO_DATA structure that is
-//      filled in upon return with the newly-opened device information element.
-//
-//  Return Value:
-//      If successful, the return value is a handle to the newly-created device
-//      information set.  If failure, the return value is INVALID_HANDLE_VALUE.
-//
-//------------------------------------------------------------------------
-HDEVINFO
-OpenPnPDeviceInstance(
-    IN  HWND             hwndParent,
-    OUT PSP_DEVINFO_DATA DeviceInfoData
-    )
-{
-    HDEVINFO DeviceInfoSet;
-    DWORD Err;
-    TCHAR PnPDeviceID[MAX_PATH];
-    DWORD PnPDeviceIDSize;
-
-    //
-    // CharBuffer is used to hold both a registry path and a device instance ID.
-    // Make sure our assumption about which string is larger remains correct.
-    //
-#if MAX_DEVICE_ID_LEN > MAX_PATH
-#error MAX_DEVICE_ID_LEN is greater than MAX_PATH.  Update CharBuffer.
-#endif
-
-    //
-    // Retrieve the PnP ISA device instance name associated with this device.
-    //
-    PnPDeviceIDSize = sizeof(PnPDeviceID);
-    if (ERROR_SUCCESS != SndblstQueryDeviceIdStringParameter(
-                                        &RegAccess,
-                                        CurrentCard,
-                                        SOUND_REG_PNPDEVICE,
-                                        (LPTSTR)PnPDeviceID,
-                                        PnPDeviceIDSize))
-        goto clean0;
-
-    //
-    // We've retrieved the device instance ID, now open this as a device
-    // information element.
-    //
-    if((DeviceInfoSet = (HDEVINFO)(DLSetupDiCreateDeviceInfoList(NULL, hwndParent))) == INVALID_HANDLE_VALUE) {
-        goto clean0;
-    }
-
-    DeviceInfoData->cbSize = sizeof(SP_DEVINFO_DATA);
-    if(DLSetupDiOpenDeviceInfo(DeviceInfoSet,
-                             PnPDeviceID,
-                             hwndParent,
-                             0,
-                             DeviceInfoData)) {
-
-        return DeviceInfoSet;
-    }
-
-    DLSetupDiDestroyDeviceInfoList(DeviceInfoSet);
-
-clean0:
-    return INVALID_HANDLE_VALUE;
-}
-
-//------------------------------------------------------------------------
-//  LONG SndblstSetDeviceIdStringParameter
-//
-//  Description:
-//      Add the string value to the device parameters section under the
-//      services node.
-//      This section is created if it does not already exist.
-//
-//  Parameters:
-//      ServiceNodeKey       Handle to the device services node key
-//      ValueName            Name of value to set
-//      Value                String value to set
-//      ValueSize            Size of string to set
-//
-//  Return Value:
-//      Standard error code (see winerror.h)
-//
-//------------------------------------------------------------------------
-LONG
-SndblstSetDeviceIdStringParameter(
+ LONG
+ DrvSetOptions(
      PREG_ACCESS RegAccess,
      UINT   DeviceNumber,
      LPTSTR ValueName,
-     LPTSTR Value,
-     DWORD  ValueSize)
-{
+     LPTSTR Value)
+ {
      HKEY ParmsKey;
      LONG ReturnCode;
 
@@ -2529,6 +1679,73 @@ SndblstSetDeviceIdStringParameter(
                                 0,                    // Reserved 0
                                 REG_SZ,               // Data type
                                 (LPBYTE)Value,        // The value
+                                ByteCountOf(lstrlen(Value)+1));       // Data length
+
+     //
+     // Free the handles we created
+     //
+
+     RegCloseKey(ParmsKey);
+
+     return ReturnCode;
+ }
+ 
+ /***************************************************************************
+ *
+ *  Function :
+ *      DrvSetBinaryValue
+ *
+ *  Parameters :
+ *      ServiceNodeKey       Handle to the device services node key
+ *      ValueName            Name of value to set
+ *      Value                REG_BINARY value to set
+ *
+ *  Return code :
+ *
+ *      Standard error code (see winerror.h)
+ *
+ *  Description :
+ *
+ *      Add the value to the device parameters section under the
+ *      services node.
+ *      This section is created if it does not already exist.
+ *
+ ***************************************************************************/
+
+ LONG
+ DrvSetBinaryValue(
+     PREG_ACCESS RegAccess,
+     UINT   DeviceNumber,
+     LPTSTR ValueName,
+     LPBYTE Value,
+     DWORD  ValueSize)
+ {
+     HKEY ParmsKey;
+     LONG ReturnCode;
+
+     //
+     //  ALWAYS create a key 0 - that way old drivers work
+     //
+     if (DeviceNumber == 0) {
+         ParmsKey = DrvOpenRegKey(RegAccess->DriverName, TEXT("Device0"));
+     } else {
+         ParmsKey = DrvOpenDeviceKey(RegAccess->DriverName, DeviceNumber);
+     }
+
+     if (ParmsKey == NULL) {
+         return ERROR_FILE_NOT_FOUND;
+     }
+
+     //
+     // Write the value
+     //
+
+
+     ReturnCode = RegSetValueEx(ParmsKey,             // Registry handle
+                                ValueName,            // Name of item
+                                0,                    // Reserved 0
+                                REG_BINARY,           // Data type
+                                (LPBYTE)Value ,       // The value
                                 ValueSize);           // Data length
 
      //
@@ -2538,57 +1755,82 @@ SndblstSetDeviceIdStringParameter(
      RegCloseKey(ParmsKey);
 
      return ReturnCode;
-}
+ }
 
-//------------------------------------------------------------------------
-//  LONG SndblstQueryDeviceIdStringParameter
-//
-//  Description:
-//      Get the string value to the device parameters section under the
-//      services node.
-//
-//  Parameters:
-//      ServiceNodeKey       Handle to the device services node key
-//      ValueName            Name of value to get
-//      Value                String value to get
-//      ValueSize            Size of string to get
-//
-//  Return Value:
-//      Standard error code (see winerror.h)
-//
-//------------------------------------------------------------------------
-LONG
-SndblstQueryDeviceIdStringParameter(
+ /***************************************************************************
+ *
+ *  Function :
+ *      GetRealString
+ *
+ *  Parameters :
+ *      ServiceNodeKey       Handle to the device services node key
+ *      StringId             Identifier of string to load
+ *      Value                Buffer of 128 bytes for resulting value
+ *
+ *  Description :
+ *
+ *      Reads a String from the device parameters section under the
+ *      services node identified by supplied string identifier.
+ *
+ ***************************************************************************/
+
+ void
+ GetRealString(
      PREG_ACCESS RegAccess,
      UINT   DeviceNumber,
-     LPTSTR ValueName,
-     LPTSTR Value,
-     DWORD  ValueSize)
-{
+     BYTE   StringId,
+     LPTSTR Value)
+ {
      HKEY ParmsKey;
      LONG ReturnCode;
-     DWORD Index;
-     DWORD Type;
-     DWORD RegValueLength = ValueSize;
+     TCHAR ValueName[4];
+     DWORD lpType = REG_SZ, ValueSize;
 
-     ParmsKey = DrvOpenDeviceKey(RegAccess->DriverName, DeviceNumber);
+     memset(Value, 0, 128);
+     
+     if (!StringId) return;
+     wsprintf(ValueName, TEXT("%d"), StringId);
+     
+     //
+     //  ALWAYS create a key 0 - that way old drivers work
+     //
+     if (DeviceNumber == 0) {
+         ParmsKey = DrvOpenRegKey(RegAccess->DriverName, TEXT("Device0"));
+     } else {
+         ParmsKey = DrvOpenDeviceKey(RegAccess->DriverName, DeviceNumber);
+     }
 
      if (ParmsKey == NULL) {
-         return ERROR_FILE_NOT_FOUND;
+         return;
      }
 
      //
-     // Get the value
+     // Read the value
      //
-     ReturnCode = RegQueryValueEx(ParmsKey,
-                                  ValueName,
-                                  NULL,
-                                  &Type,
-                                  (LPBYTE)Value,
-                                  &RegValueLength);
+
+     ValueSize = 130;
+     ReturnCode = RegQueryValueEx(ParmsKey,             // Registry handle
+                                  ValueName,            // Name of item
+                                  0,                    // Reserved 0
+                                  &lpType,              // Data type
+                                  (LPBYTE)Value ,       // The value
+                                  &ValueSize);          // Data length
+
+     //
+     // Free the handles we created
+     //
 
      RegCloseKey(ParmsKey);
+ }
 
-     return ReturnCode;
+VOID AddEssAPMEntry()
+{
+    TCHAR szAPM[] = {TEXT("essapm.exe")};
+    HKEY hKey;
+
+    if ( RegCreateKey(HKEY_LOCAL_MACHINE, TEXT("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"), &hKey)  == ERROR_SUCCESS)
+    {
+        RegSetValueEx(hKey, TEXT("essapm"), 0, REG_SZ, (PBYTE)szAPM, (lstrlen(szAPM) + 1) * sizeof(TCHAR));
+        RegCloseKey(hKey);
+    }
 }
-

@@ -6,9 +6,9 @@
 
 #define VER_FILETYPE                VFT_DRV
 #define VER_FILESUBTYPE             VFT2_DRV_SOUND
-#define VER_FILEDESCRIPTION_STR     "Sound Blaster 16 Adapter Driver"
-#define VER_INTERNALNAME_STR        "sb16.sys"
-#define VER_ORIGINALFILENAME_STR    "sb16.sys"
+#define VER_FILEDESCRIPTION_STR     "ESS ES1969 PCI Audio Adapter Driver"
+#define VER_INTERNALNAME_STR        "es1969.sys"
+#define VER_ORIGINALFILENAME_STR    "es1969.sys"
 
 #include "common.ver"
 

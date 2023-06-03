@@ -1,7 +1,7 @@
 /*****************************************************************************
- * common.cpp - Common code used by all the sb16 miniports.
+ * common.cpp - Common code used by all the ESS miniports.
  *****************************************************************************
- * Copyright (c) 1997-2000 Microsoft Corporation.  All rights reserved.
+ * Copyright (c) 2023 leecher@dose.0wnz.at  All rights reserved.
  *
  * Implmentation of the common code object.  This class deals with interrupts
  * for the device, and is a collection of common code used by all the
@@ -9,10 +9,65 @@
  */
 
 #include "common.h"
+#include "DRIVER.H"
 
-#define STR_MODULENAME "sb16Adapter: "
+#define STR_MODULENAME "es1969Adapter: "
 
+#define FLAG_PNP                0x01
+#define FLAG_TWOBUTTONVOLMODE   0x02
+#define FLAG_SIDSVIDUPDATE      0x10
+#define FLAG_IISON              0x20
+#define FLAG_HWVOLUMEON         0x40
+#define FLAG_COUNTBY3           0x80
+#define FLAG_NOGAMEPORT         0x100
 
+static
+MIXERSETTING DefaultMixerSettings[] =
+{
+    { L"PNP",                 FLAG_PNP              },
+    { L"TwoButtonVolumeMode", FLAG_TWOBUTTONVOLMODE },
+    { L"SidSvidUpdate",       FLAG_SIDSVIDUPDATE    },
+    { L"IISOn",               FLAG_IISON            },
+    { L"HwVolumeOn",          FLAG_HWVOLUMEON       },
+    { L"CountBy3",            FLAG_COUNTBY3         },
+    { L"NoGamePort",          FLAG_NOGAMEPORT       }
+};
+
+static
+CONFIGSETTING ConfigSettings[] =
+{
+    {ESS_CMD_IRQCONTROL,        0, FALSE},
+    {ESS_CMD_DRQCONTROL,        0, FALSE},
+    {ESS_CMD_EXTSAMPLERATE,     0, FALSE},
+    {ESS_CMD_FILTERDIV,         0, FALSE},
+    {0x40,                      0, TRUE },
+    {ESM_MIXER_MASTER_VOL_CTL,   0, TRUE },
+    {ESM_MIXER_MIC_PREAMP,      0, TRUE },
+    {ESM_MIXER_MDR,             0, TRUE },
+    {ESM_MIXER_AUDIO2_MODE,     0, TRUE },
+    {ESM_MIXER_EXTENDEDRECSRC,  0, TRUE },
+    {ESM_MIXER_AUDIO2_VOL,      0, TRUE },
+    {0,                         0, FALSE}
+};
+
+static 
+SAVED_CONFIG SavedConfig[] =
+{
+    {ESM_PMSTATUS,              0},
+    {ESM_CMD,                   0},
+    {ESM_IRQLINE,               0},
+    {ESM_LEGACY_AUDIO_CONTROL,  0},
+    {ESM_CONFIG,                0},
+    {ESM_DDMA,                  0}
+};
+
+DWORD RunTime = 0;
+extern BOOL NoJoy;
+BOOLEAN bMPU401IntEnable = FALSE;
+
+#define RUNTIME_FLAG_NODRM  0x4000
+
+BOOLEAN SidSvidUpdate = FALSE;
 
 
 /*****************************************************************************
@@ -29,14 +84,36 @@ class CAdapterCommon
 {
 private:
     PINTERRUPTSYNC          m_pInterruptSync;
-    PUCHAR                  m_pWaveBase;
-    PWAVEMINIPORTSB16       m_WaveMiniportSB16;
-#ifdef EVENT_SUPPORT
-    PTOPOMINIPORTSB16       m_TopoMiniportSB16;     // Topology miniport of SB16.
-#endif
+    PPORTWAVECYCLIC         m_pPortWave;
+    PPORTMIDI               m_pPortMidi;
+    PSERVICEGROUP           m_pWaveServiceGroup;
     PDEVICE_OBJECT          m_pDeviceObject;
+    
+    PUCHAR                  m_pIOBase;
+    PUCHAR                  m_pSBBase;
+    PUCHAR                  m_pFMBase;
+    PUCHAR                  m_pDMABase;
+    PUCHAR                  m_pMPU401Base;
+    PUCHAR                  m_pJoystickBase;
+    
+    BOOLEAN                 m_Recording;
+    SETTING                 *m_pMixerVolumesIn;
+    SETTING                 *m_pMixerVolumesOut;
+    DWORD                   m_BoardId;
     DEVICE_POWER_STATE      m_PowerState;
-    BYTE                    MixerSettings[DSP_MIX_MAXREGS];
+    DWORD                   m_Flags;
+    BOOLEAN                 m_MidiActive;
+    BOOL                    m_MuteInput;
+    BOOLEAN                 m_DmaStarted;
+    PDWORD                  m_pRecordingSource;
+    BOOLEAN                 m_CPE;
+    
+    PPORTEVENTS             m_pPortEvents;
+    
+    BYTE                    m_HardwareVolumeFlag;
+    BOOLEAN                 m_MuteOutput;
+    USHORT                  m_DeviceID;
+
 
     void AcknowledgeIRQ
     (   void
@@ -52,54 +129,199 @@ public:
      */
     STDMETHODIMP_(NTSTATUS) Init
     (
-        IN      PRESOURCELIST   ResourceList,
-        IN      PDEVICE_OBJECT  DeviceObject
+        PRESOURCELIST ResourceList, 
+        PDEVICE_OBJECT DeviceObject
     );
+
+    STDMETHODIMP_(void) PostProcessing
+    (   void
+    );
+
+    STDMETHODIMP_(NTSTATUS) SoloPciInit
+    (
+        IN      PDEVICE_OBJECT  DeviceObject,
+        OUT     PBOOLEAN        pIs1969
+    );
+
+    STDMETHODIMP_(PPORTWAVECYCLIC *) WavePortDriverDest
+    (   void
+    );
+
+    STDMETHODIMP_(void) SetPortEventsDest
+    (
+        IN      PPORTEVENTS  PortEvents
+    );
+
     STDMETHODIMP_(PINTERRUPTSYNC) GetInterruptSync
     (   void
     );
-    STDMETHODIMP_(void) SetWaveMiniport (IN PWAVEMINIPORTSB16 Miniport)
-    {
-        m_WaveMiniportSB16 = Miniport;
-    }
-    STDMETHODIMP_(BYTE) ReadController
+
+    STDMETHODIMP_(PPORTMIDI*) MidiPortDriverDest
     (   void
     );
-    STDMETHODIMP_(BOOLEAN) WriteController
+
+    STDMETHODIMP_(void) SetWaveServiceGroup
     (
-        IN      BYTE    Value
+        IN      PSERVICEGROUP  WaveServiceGroup
     );
-    STDMETHODIMP_(NTSTATUS) ResetController
+
+    STDMETHODIMP_(DWORD) GetFlags
     (   void
     );
-    STDMETHODIMP_(void) MixerRegWrite
+
+    STDMETHODIMP_(void) SetHardwareVolumeFlag
     (
-        IN      BYTE    Index,
-        IN      BYTE    Value
+        IN      BYTE    Flag
     );
-    STDMETHODIMP_(BYTE) MixerRegRead
+
+    STDMETHODIMP_(DWORD) GetHardwareVolumeFlag
     (
-        IN      BYTE    Index
+        IN      BYTE    Mask
     );
-    STDMETHODIMP_(void) MixerReset
+
+    STDMETHODIMP_(void) SetMute
+    (
+        IN      BYTE     Mute
+    );
+
+    STDMETHODIMP_(UCHAR) dspRead
     (   void
     );
-    STDMETHODIMP RestoreMixerSettingsFromRegistry
+
+    STDMETHODIMP_(UCHAR) dspWrite
+    (
+        IN  UCHAR       Value
+    );
+
+    STDMETHODIMP_(void) StartESFM
+    (   
+        IN  BOOLEAN     MidiActive
+    );
+
+    STDMETHODIMP_(void) SetDacToMidi
+    (   
+        IN  BOOLEAN     MidiActive
+    );
+
+    STDMETHODIMP_(BOOLEAN) IsMidiActive
     (   void
     );
-    STDMETHODIMP SaveMixerSettingsToRegistry
+
+    STDMETHODIMP_(void) Init689
     (   void
     );
-#ifdef EVENT_SUPPORT
-    //
-    // The topology miniport needs to tell us the pointer to the Event-interface.
-    //
-    STDMETHODIMP_(void) SetTopologyMiniport (IN PTOPOMINIPORTSB16 Miniport)
-    {
-        m_TopoMiniportSB16 = Miniport;
-    };
-#endif
+
+    STDMETHODIMP_(void) Enable_Irq
+    (   void
+    );
+
+    STDMETHODIMP_(void) StartDma
+    (
+        IN      BOOLEAN    Capture,
+        IN      ULONG      DMAChannelAddress,
+        IN      ULONG      BufferSize,
+        IN      BOOLEAN    Format16Bit,
+        IN      BOOLEAN    FormatStereo,
+        IN      ULONG      NotificationInterval,
+        IN      ULONG      SamplingFrequency
+    );
+
+    STDMETHODIMP_(void) PauseDma
+    (
+        IN      BOOLEAN    Capture
+    );
+
+    STDMETHODIMP_(void) StopDma
+    (
+        IN      BOOLEAN    Capture
+    );
+
+    STDMETHODIMP_(PUCHAR) SetDspBase
+    (
+        IN      PUCHAR  DspBase
+    );
+
+    STDMETHODIMP_(void) DRM_SetFlags
+    (
+        IN      BOOL    Mute,
+        IN      BOOL    a3
+    );
+
+    STDMETHODIMP_(void) RestoreConfig
+    (   void
+    );
+
+    STDMETHODIMP_(void) SaveConfig
+    (   void
+    );
+
+    STDMETHODIMP_(void) SetClkRunEnable
+    (
+        IN      BOOLEAN    Enable
+    );
+
+    STDMETHODIMP_(void) SetRecordingSource
+    (
+        IN      PDWORD     RecordingSource
+    );
+
+    STDMETHODIMP_(DWORD) BoardId
+    (   void
+    );
+
+    STDMETHODIMP_(BOOL) IsRecording
+    (   void
+    );
+
+    STDMETHODIMP_(void) StartRecording
+    (
+        IN      BOOLEAN    Recording
+    );
+
+    STDMETHODIMP_(void) SetMixerTables
+    (
+        IN      PUCHAR     Table1,
+        IN      PUCHAR     Table0
+    );
+
+    STDMETHODIMP_(USHORT) GetDeviceID
+    (   void
+    );
+
+    STDMETHODIMP_(USHORT) GetPosition
+    (
+        IN      BOOLEAN    Capture,
+        IN      UINT       DmaBufferSize
+    );
+
+    STDMETHODIMP_(UCHAR) dspReadMixer
+    (
+        IN  UCHAR   Address
+    );
+
+    STDMETHODIMP_(void) dspWriteMixer
+    (
+        IN  UCHAR   Address,
+        IN  UCHAR   Value
+    );
     
+    STDMETHODIMP_(void) GetRegistrySettings
+    (   void
+    );
+
+    STDMETHODIMP_(void) SetRegistrySettings
+    (   void
+    );
+    
+    STDMETHODIMP_(void) dspReset
+    (   void
+    );
+    
+    inline STDMETHODIMP_(void) SysExMessage
+    (   IN      BYTE    Command
+    );
+
+
     /*************************************************************************
      * IAdapterPowerManagement implementation
      *
@@ -116,38 +338,218 @@ public:
     );
 };
 
-static
-MIXERSETTING DefaultMixerSettings[] =
-{
-    { L"LeftMasterVol",   DSP_MIX_MASTERVOLIDX_L,     0xD8 },
-    { L"RightMasterVol",  DSP_MIX_MASTERVOLIDX_R,     0xD8 },
-    { L"LeftWaveVol",     DSP_MIX_VOICEVOLIDX_L,      0xD8 },
-    { L"RightWaveVol",    DSP_MIX_VOICEVOLIDX_R,      0xD8 },
-    { L"LeftMidiVol",     DSP_MIX_FMVOLIDX_L,         0xD8 },
-    { L"RightMidiVol",    DSP_MIX_FMVOLIDX_R,         0xD8 },
-    { L"LeftCDVol",       DSP_MIX_CDVOLIDX_L,         0xD8 },
-    { L"RightCDVol",      DSP_MIX_CDVOLIDX_R,         0xD8 },
-    { L"LeftLineInVol",   DSP_MIX_LINEVOLIDX_L,       0xD8 },
-    { L"RightLineInVol",  DSP_MIX_LINEVOLIDX_R,       0xD8 },
-    { L"MicVol",          DSP_MIX_MICVOLIDX,          0xD8 },
-    { L"PcSpkrVol",       DSP_MIX_SPKRVOLIDX,         0x00 },
-    { L"OutputMixer",     DSP_MIX_OUTMIXIDX,          0x1E },
-    { L"LeftInputMixer",  DSP_MIX_ADCMIXIDX_L,        0x55 },
-    { L"RightInputMixer", DSP_MIX_ADCMIXIDX_R,        0x2B },
-    { L"LeftInputGain",   DSP_MIX_INGAINIDX_L,        0x00 },
-    { L"RightInputGain",  DSP_MIX_INGAINIDX_R,        0x00 },
-    { L"LeftOutputGain",  DSP_MIX_OUTGAINIDX_L,       0x80 },
-    { L"RightOutputGain", DSP_MIX_OUTGAINIDX_R,       0x80 },
-    { L"MicAGC",          DSP_MIX_AGCIDX,             0x01 },
-    { L"LeftTreble",      DSP_MIX_TREBLEIDX_L,        0x80 },
-    { L"RightTreble",     DSP_MIX_TREBLEIDX_R,        0x80 },
-    { L"LeftBass",        DSP_MIX_BASSIDX_L,          0x80 },
-    { L"RightBass",       DSP_MIX_BASSIDX_R,          0x80 },
-};
 
 
 
 #pragma code_seg("PAGE")
+
+NTSTATUS 
+ConfigAccessCompletionRoutine(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp, 
+    PRKEVENT Event
+    )
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    KeSetEvent(Event, IO_NO_INCREMENT, FALSE);
+    IoFreeIrp(Irp);
+    return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+NTSTATUS
+AccessConfigSpace(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN BOOLEAN Read,
+    IN PVOID Buffer,
+    IN ULONG Offset,
+    IN ULONG Length
+    )
+/*++
+
+Routine Description:
+
+    Reads or writes PCI config space for the specified device.
+
+Arguments:
+
+    DeviceObject - Supplies the device object
+
+    Read - if TRUE, this is a READ IRP
+           if FALSE, this is a WRITE IRP
+
+    Buffer - Returns the PCI config data
+
+    Offset - Supplies the offset into the PCI config data where the read should begin
+
+    Length - Supplies the number of bytes to be read
+
+Return Value:
+
+    NTSTATUS
+
+--*/
+
+{
+    NTSTATUS Status;
+    PIRP Irp;
+    KEVENT Event;
+    PIO_STACK_LOCATION pStack;
+    
+    PAGED_CODE();
+    ASSERT(DeviceObject);
+    ASSERT(Buffer);
+
+    Irp = IoAllocateIrp(DeviceObject->StackSize, FALSE);
+    if ( !Irp ) return STATUS_INSUFFICIENT_RESOURCES;
+
+    pStack = IoGetNextIrpStackLocation (Irp);
+    pStack->MajorFunction = IRP_MJ_PNP;
+    pStack->MinorFunction = Read ? IRP_MN_READ_CONFIG : IRP_MN_WRITE_CONFIG;
+    pStack->Parameters.ReadWriteConfig.Offset = Offset;
+    pStack->Parameters.ReadWriteConfig.Buffer = Buffer;
+    pStack->Parameters.ReadWriteConfig.Length = Length;
+    pStack->Parameters.ReadWriteConfig.WhichSpace = PCI_WHICHSPACE_CONFIG;
+    pStack->DeviceObject = DeviceObject;
+
+    Irp->Tail.Overlay.Thread = PsGetCurrentThread();
+    Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+    KeInitializeEvent(&Event, SynchronizationEvent, FALSE);
+    pStack = IoGetNextIrpStackLocation (Irp);
+    pStack->Context = &Event;
+    pStack->CompletionRoutine = (PIO_COMPLETION_ROUTINE)ConfigAccessCompletionRoutine;
+    pStack->Control = SL_INVOKE_ON_SUCCESS | SL_INVOKE_ON_ERROR | SL_INVOKE_ON_CANCEL;
+    Status = IoCallDriver(DeviceObject, Irp);
+    if ( Status == STATUS_PENDING ) {
+        return KeWaitForSingleObject( &Event,
+                                      Executive,
+                                      KernelMode,
+                                      FALSE,
+                                      (PLARGE_INTEGER)NULL );
+    }
+    return Status;
+}
+
+/*****************************************************************************
+ * CAdapterCommon::GetRegistrySettings()
+ *****************************************************************************
+ * Restores the mixer settings based on settings stored in the registry.
+ */
+void
+CAdapterCommon::
+GetRegistrySettings
+(   void
+)
+{
+    PREGISTRYKEY    DriverKey;
+    PVOID           KeyInfo;
+
+    PAGED_CODE();
+    
+    // open the driver registry key
+    NTSTATUS ntStatus = PcNewRegistryKey( &DriverKey,               // IRegistryKey
+                                          NULL,                     // OuterUnknown
+                                          DriverRegistryKey,        // Registry key type
+                                          KEY_ALL_ACCESS,           // Access flags
+                                          m_pDeviceObject,          // Device object
+                                          NULL,                     // Subdevice
+                                          NULL,                     // ObjectAttributes
+                                          0,                        // Create options
+                                          NULL );                   // Disposition
+    if(NT_SUCCESS(ntStatus))
+    {
+        UNICODE_STRING  KeyName;
+        ULONG           ResultLength;
+        
+        KeyInfo = ExAllocatePool(PagedPool, sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(DWORD));
+        if(NULL != KeyInfo)
+        {
+            // make a unicode strong for the subkey name
+            RtlInitUnicodeString( &KeyName, L"RunTime" );
+
+            // query the value key
+            ntStatus = DriverKey->QueryValueKey( &KeyName,
+                                                   KeyValuePartialInformation,
+                                                   KeyInfo,
+                                                   sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(DWORD),
+                                                   &ResultLength );
+            if(NT_SUCCESS(ntStatus))
+            {
+                PKEY_VALUE_PARTIAL_INFORMATION PartialInfo = PKEY_VALUE_PARTIAL_INFORMATION(KeyInfo);
+
+                if(PartialInfo->DataLength == sizeof(DWORD))
+                {
+                    RunTime = *(PDWORD(PartialInfo->Data));
+                }
+
+                // loop through all mixer settings
+                for(UINT i = 0; i < SIZEOF_ARRAY(DefaultMixerSettings); i++)
+                {
+                    // init key name
+                    RtlInitUnicodeString( &KeyName, DefaultMixerSettings[i].KeyName );
+    
+                    // query the value key
+                    ntStatus = DriverKey->QueryValueKey( &KeyName,
+                                                           KeyValuePartialInformation,
+                                                           KeyInfo,
+                                                           sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(DWORD),
+                                                           &ResultLength );
+                    if(NT_SUCCESS(ntStatus))
+                    {
+                        PartialInfo = PKEY_VALUE_PARTIAL_INFORMATION(KeyInfo);
+
+                        if(PartialInfo->DataLength == sizeof(DWORD) && *(PDWORD(PartialInfo->Data)))
+                        {
+                            m_Flags |= DefaultMixerSettings[i].RegisterSetting;
+                        }
+                    }
+                }
+
+                // free the key info
+                ExFreePool(KeyInfo);
+            }
+        }
+
+        // release the driver key
+        DriverKey->Release();
+    }
+}
+
+/*****************************************************************************
+ * CAdapterCommon::SetRegistrySettings()
+ *****************************************************************************
+ * Applies settings from Flags to card
+ */
+void
+CAdapterCommon::
+SetRegistrySettings
+(   void
+)
+{
+    BYTE PortData;
+
+    PAGED_CODE();
+    
+    NoJoy = (m_Flags & FLAG_NOGAMEPORT) ? TRUE : FALSE;
+    
+    if (m_Flags & FLAG_HWVOLUMEON)
+    {
+        ESMMIXERMVC Mixer;
+        
+        Mixer.b = dspReadMixer(ESM_MIXER_MASTER_VOL_CTL);
+        Mixer.f.Mode = (m_Flags & FLAG_TWOBUTTONVOLMODE)?1:2;
+        Mixer.f.HMVmask = 1;
+        Mixer.f.CountBy3 = (m_Flags & FLAG_COUNTBY3)?1:0;
+        dspWriteMixer(ESM_MIXER_MASTER_VOL_CTL, Mixer.b);
+    }
+    
+    if (m_Flags & FLAG_SIDSVIDUPDATE) SidSvidUpdate = TRUE;
+    
+    PortData = dspReadMixer(ESM_MIXER_MDR) & 0xFE;
+    if (m_Flags & FLAG_IISON) PortData |= 1;
+    dspWriteMixer(ESM_MIXER_MDR, PortData);
+}
+
 
 /*****************************************************************************
  * NewAdapterCommon()
@@ -175,8 +577,75 @@ NewAdapterCommon
         PoolType,
         PADAPTERCOMMON
     );
-}   
+}
 
+/*****************************************************************************
+ * CAdapterCommon::AcknowledgeIRQ()
+ *****************************************************************************
+ * Acknowledge interrupt request.
+ */
+void
+CAdapterCommon::
+AcknowledgeIRQ
+(   void
+)
+{
+    PAGED_CODE();
+    
+    ASSERT(m_pSBBase);
+    READ_PORT_UCHAR (m_pSBBase + ESSSB_REG_STATUS);
+    dspWriteMixer(ESM_MIXER_CLRHWVOLIRQ, 0x66);
+    dspWriteMixer(ESM_MIXER_AUDIO2_CTL2, 0x7F);
+}
+
+
+/*****************************************************************************
+ * CAdapterCommon::dspReset()
+ *****************************************************************************
+ * Resets the DSP
+ */
+void
+CAdapterCommon::
+dspReset
+(   void
+)
+{
+    PAGED_CODE();
+    
+    WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_RESET, 1);
+    KeStallExecutionProcessor(3);
+    WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_RESET, 0);
+    
+    if (dspRead() == 0xAA) dspWrite(ESS_CMD_ENABLEEXT);
+}
+
+
+BOOL Setup689(PUCHAR Port)
+{   
+    PAGED_CODE();
+
+    WRITE_PORT_UCHAR(Port + MPU401_REG_COMMAND, MPU401_CMD_RESET);
+    if ((READ_PORT_UCHAR(Port + MPU401_REG_STATUS) & MPU401_DSR) != 0 )
+        WRITE_PORT_UCHAR(Port + MPU401_REG_COMMAND, MPU401_CMD_RESET);
+    if ((READ_PORT_UCHAR(Port + MPU401_REG_STATUS) & MPU401_DSR) != 0 )
+        return FALSE;
+    if (READ_PORT_UCHAR(Port + MPU401_REG_DATA) != MPU401_ACK)
+        return FALSE;
+
+    WRITE_PORT_UCHAR(Port + MPU401_REG_COMMAND, MPU401_CMD_UART);
+    if ( READ_PORT_UCHAR(Port + MPU401_REG_DATA) != MPU401_ACK)
+        return FALSE;
+    
+    // SysEx message 04
+    WRITE_PORT_UCHAR(Port + MPU401_REG_DATA, 0xF0);
+    WRITE_PORT_UCHAR(Port + MPU401_REG_DATA, 0x00);
+    WRITE_PORT_UCHAR(Port + MPU401_REG_DATA, 0x00);
+    WRITE_PORT_UCHAR(Port + MPU401_REG_DATA, 0x7B);
+    WRITE_PORT_UCHAR(Port + MPU401_REG_DATA, 0x04);
+    WRITE_PORT_UCHAR(Port + MPU401_REG_DATA, 0xF7);
+    
+    return TRUE;
+}
 
 /*****************************************************************************
  * CAdapterCommon::Init()
@@ -195,45 +664,42 @@ Init
 
     ASSERT(ResourceList);
     ASSERT(DeviceObject);
-
-    //
-    // Make sure we have the resources we expect
-    //
-    if ((ResourceList->NumberOfPorts() < 1) ||
-        (ResourceList->NumberOfInterrupts() != 1))
-    {
-        _DbgPrintF (DEBUGLVL_TERSE, ("unknown configuration; check your code!"));
-        // Bail out.
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    ASSERT(ResourceList->NumberOfPorts() == 5);
+    ASSERT(ResourceList->NumberOfInterrupts() == 1);
+    ASSERT(ResourceList->NumberOfDmas() == 0);
     
+    BOOLEAN  Is1969;
+    NTSTATUS ntStatus;
+    DWORD    PortData;
+
+   
     m_pDeviceObject = DeviceObject;
-    m_WaveMiniportSB16 = NULL;
-#ifdef EVENT_SUPPORT
-    m_TopoMiniportSB16 = NULL;
-#endif
 
-    //
-    // Get the base address for the wave device.
-    //
-    ASSERT(ResourceList->FindTranslatedPort(0));
-    m_pWaveBase = (PUCHAR)(ResourceList->FindTranslatedPort(0)->u.Port.Start.QuadPart);
-
-    //
-    // Set initial device power state
-    //
-    m_PowerState = PowerDeviceD0;
-
-    //
-    // Reset the hardware.
-    //
-    NTSTATUS ntStatus = ResetController();
-
+    ntStatus = SoloPciInit(DeviceObject, &Is1969);
+  
     if(NT_SUCCESS(ntStatus))
     {
-        _DbgPrintF(DEBUGLVL_VERBOSE,("ResetController Succeeded"));
-        AcknowledgeIRQ();
-    
+        
+        //
+        // Get the base address for the devices.
+        //
+        ASSERT(ResourceList->FindTranslatedPort(0));
+        m_pIOBase   = (PUCHAR)(ResourceList->FindTranslatedPort(0)->u.Port.Start.QuadPart);
+
+        ASSERT(ResourceList->FindTranslatedPort(1));
+        m_pSBBase      = (PUCHAR)(ResourceList->FindTranslatedPort(1)->u.Port.Start.QuadPart);
+
+        ASSERT(ResourceList->FindTranslatedPort(2));
+        m_pFMBase       = (PUCHAR)(ResourceList->FindTranslatedPort(2)->u.Port.Start.QuadPart);
+
+        ASSERT(ResourceList->FindTranslatedPort(3));
+        m_pMPU401Base   = (PUCHAR)(ResourceList->FindTranslatedPort(3)->u.Port.Start.QuadPart);
+
+        ASSERT(ResourceList->FindTranslatedPort(4));
+        m_pJoystickBase = (PUCHAR)(ResourceList->FindTranslatedPort(4)->u.Port.Start.QuadPart);
+        
+        m_pDMABase      = Is1969 ? m_pFMBase : m_pIOBase + 16;
+
         //
         // Hook up the interrupt.
         //
@@ -263,9 +729,100 @@ Init
     {
         _DbgPrintF(DEBUGLVL_TERSE,("ResetController Failure"));
     }
+    
+    m_MuteInput = FALSE;
+    RunTime = 0;
 
+    if(NT_SUCCESS(ntStatus))
+    {
+        ESMCONFIG Config;
+        ESMMIXERMVC Mixer;
+        
+        PortData = ESS_DISABLE_AUDIO | MPU401_IRQ_ENABLE | MPU401_IO_ENABLE | GAME_IO_ENABLE | FM_IO_ENABLE | SB_IO_ENABLE;
+        AccessConfigSpace(DeviceObject, FALSE, &PortData, ESM_LEGACY_AUDIO_CONTROL, sizeof(PortData));
+        
+        AccessConfigSpace(DeviceObject, TRUE , &Config, ESM_CONFIG, sizeof(Config));
+        Config.S2     = 0; // SB Base = 220h
+        Config.M4D    = 0; // MPU401  = 330h
+        Config.DMMAP  = 0; // DMA Policy = Distributed DMA
+        Config.IRQP   = 0; // ISA IRQ Emulation is disabled
+        Config.ISAIRQ = 0; // ISA IRQ Enable = 0
+        m_CPE = Config.CPE;
+        AccessConfigSpace(DeviceObject, FALSE, &Config, ESM_CONFIG, sizeof(Config));
+        
+        PortData = LOWORD(m_pDMABase) | 1; // Enable distributed DMA
+        AccessConfigSpace(DeviceObject, FALSE, &PortData, ESM_DDMA, sizeof(PortData));
+        
+        // Turn on interrupts
+        WRITE_PORT_UCHAR(m_pIOBase + ESSIO_REG_IRQCONTROL, ESS_ALLIRQ);
+        
+        GetRegistrySettings();
+        SetRegistrySettings();
+        dspReset();
+        
+        dspWriteMixer(ESM_MIXER_OPAMP_CALIB, 1);
+        Mixer.b = dspReadMixer(ESM_MIXER_MASTER_VOL_CTL);
+        if (m_Flags & FLAG_HWVOLUMEON)
+        {
+            Mixer.f.SbProVol = 1;
+            Mixer.f.HMVmask = 1;
+        }
+        else Mixer.f.HMVmask = 0;
+        Mixer.f.MPU401Int = 0;
+        dspWriteMixer(ESM_MIXER_MASTER_VOL_CTL, Mixer.b);
+        AcknowledgeIRQ();
+        Setup689(m_pMPU401Base);
+        
+        m_BoardId = 0x1869;
+        StartESFM(FALSE);
+        
+        //
+        // Set initial device power state
+        //
+        m_PowerState = PowerDeviceD0;
+    }
+    
     return ntStatus;
 }
+
+/*****************************************************************************
+ * CAdapterCommon::PostProcessing()
+ *****************************************************************************
+ * Do some postprocessing
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+PostProcessing
+(   void
+)
+{
+    PAGED_CODE();
+    
+    // Enable Interrupts
+    dspWriteMixer(ESM_MIXER_MASTER_VOL_CTL, dspReadMixer(ESM_MIXER_MASTER_VOL_CTL) | 0x42);
+    SetDacToMidi(FALSE);
+}
+
+STDMETHODIMP_(NTSTATUS)
+CAdapterCommon::
+SoloPciInit
+(
+    IN      PDEVICE_OBJECT  DeviceObject,
+    OUT     PBOOLEAN        pIs1969
+)
+{
+    PAGED_CODE();
+
+    DWORD PortData;
+    
+    AccessConfigSpace(DeviceObject, TRUE, &PortData, 0, sizeof(PortData));
+    
+    m_DeviceID = HIWORD(PortData);
+    *pIs1969 = m_DeviceID == 0x1938 || m_DeviceID == 0x1969;
+    
+    return STATUS_SUCCESS;
+}
+
 
 /*****************************************************************************
  * CAdapterCommon::~CAdapterCommon()
@@ -279,14 +836,21 @@ CAdapterCommon::
 {
     PAGED_CODE();
 
-    _DbgPrintF(DEBUGLVL_VERBOSE,("[CAdapterCommon::~CAdapterCommon]"));
-
+    // Disable Interrupts
+    dspWriteMixer(ESM_MIXER_MASTER_VOL_CTL, dspReadMixer(ESM_MIXER_MASTER_VOL_CTL) & ~(0x42));
+    WRITE_PORT_UCHAR(m_pIOBase + ESSIO_REG_IRQCONTROL, 0);
+    
     if (m_pInterruptSync)
     {
         m_pInterruptSync->Disconnect();
         m_pInterruptSync->Release();
-        m_pInterruptSync = NULL;
     }
+    if (m_pPortWave)
+        m_pPortWave->Release();
+    if (m_pPortMidi)
+        m_pPortMidi->Release();
+    if (m_pWaveServiceGroup)
+        m_pWaveServiceGroup->Release();
 }
 
 /*****************************************************************************
@@ -335,6 +899,39 @@ NonDelegatingQueryInterface
 }
 
 /*****************************************************************************
+ * CAdapterCommon::WavePortDriverDest()
+ *****************************************************************************
+ * Get the Wave Port Driver object
+ */
+STDMETHODIMP_(PPORTWAVECYCLIC *)
+CAdapterCommon::
+WavePortDriverDest
+(   void
+)
+{
+    PAGED_CODE();
+    
+    return &m_pPortWave;
+}
+
+/*****************************************************************************
+ * CAdapterCommon::SetPortEventsDest()
+ *****************************************************************************
+ * Get the Wave Port Driver object
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+SetPortEventsDest
+(
+    IN  PPORTEVENTS  PortEvents
+)
+{
+    PAGED_CODE();
+    
+    m_pPortEvents = PortEvents;
+}
+
+/*****************************************************************************
  * CAdapterCommon::GetInterruptSync()
  *****************************************************************************
  * Get a pointer to the interrupt synchronization object.
@@ -346,402 +943,604 @@ GetInterruptSync
 )
 {
     PAGED_CODE();
-
+    
     return m_pInterruptSync;
 }
 
-#pragma code_seg()
-
 /*****************************************************************************
- * CAdapterCommon::ReadController()
+ * CAdapterCommon::MidiPortDriverDest()
  *****************************************************************************
- * Read a byte from the controller.
+ * Get Midi Port driver class instance
  */
-STDMETHODIMP_(BYTE)
+STDMETHODIMP_(PPORTMIDI*)
 CAdapterCommon::
-ReadController
+MidiPortDriverDest
 (   void
 )
 {
-    BYTE returnValue = BYTE(-1);
-
-    ASSERT(m_pWaveBase);
-
-    ULONGLONG startTime = PcGetTimeInterval(0);
-
-    do {
-        if (READ_PORT_UCHAR (m_pWaveBase + DSP_REG_DATAAVAIL) & 0x80)
-        {
-            returnValue = READ_PORT_UCHAR (m_pWaveBase + DSP_REG_READ);
-        }
-    } while ((PcGetTimeInterval(startTime) < GTI_MILLISECONDS(100)) &&
-             (BYTE(-1) == returnValue));
-
-
-    ASSERT((BYTE(-1) != returnValue) || !"ReadController timeout!");
-
-    return returnValue;
+    PAGED_CODE();
+    
+    return &m_pPortMidi;
 }
 
 /*****************************************************************************
- * CAdapterCommon::WriteController()
+ * CAdapterCommon::SetWaveServiceGroup()
  *****************************************************************************
- * Write a byte to the controller.
+ * Sets wave service group
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+SetWaveServiceGroup
+(
+    IN  PSERVICEGROUP  WaveServiceGroup
+)
+{
+    PAGED_CODE();
+    
+    if ( m_pWaveServiceGroup )
+        m_pWaveServiceGroup->Release();
+    
+    m_pWaveServiceGroup = WaveServiceGroup;
+    
+    if ( WaveServiceGroup )
+        WaveServiceGroup->AddRef();
+}
+
+
+/*****************************************************************************
+ * CAdapterCommon::GetFlags()
+ *****************************************************************************
+ * Get the configuration flags currently set
+ */
+STDMETHODIMP_(DWORD)
+CAdapterCommon::
+GetFlags
+(   void
+)
+{
+    PAGED_CODE();
+    
+    return m_Flags;
+}
+
+/*****************************************************************************
+ * CAdapterCommon::SetHardwareVolumeFlag()
+ *****************************************************************************
+ * Sets hardware volume flag
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+SetHardwareVolumeFlag
+(
+    IN      BYTE    Flag
+)
+{
+    m_HardwareVolumeFlag &= ~Flag;
+    
+    if ( m_HardwareVolumeFlag == 2 )
+        m_pPortEvents->GenerateEventList(NULL, KSEVENT_CONTROL_CHANGE, FALSE, 
+            ULONG(-1), TRUE, 0x1B);
+
+}
+
+/*****************************************************************************
+ * CAdapterCommon::GetHardwareVolumeFlag()
+ *****************************************************************************
+ * Get the Hardware volume flag currently set
+ */
+STDMETHODIMP_(DWORD)
+CAdapterCommon::
+GetHardwareVolumeFlag
+(
+    IN      BYTE    Mask
+)
+{
+    return m_HardwareVolumeFlag & Mask;
+}
+
+/*****************************************************************************
+ * CAdapterCommon::SetMute()
+ *****************************************************************************
+ * Mutes the Soundcard
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+SetMute
+(
+    IN      BYTE     Mute
+)
+{
+    m_MuteOutput = Mute;
+}
+
+
+/*****************************************************************************
+ * CAdapterCommon::dspRead()
+ *****************************************************************************
+ * Reads from the DSP
+ */
+STDMETHODIMP_(UCHAR)
+CAdapterCommon::
+dspRead
+(   void
+)
+{
+    ULONGLONG TimeInterval, i;
+
+    PAGED_CODE();
+    
+    ASSERT(m_pSBBase);
+    
+    TimeInterval = PcGetTimeInterval(0);
+    
+    if ( (READ_PORT_UCHAR(m_pSBBase + ESSSB_REG_STATUS) & 0x80) != 0 )
+        return READ_PORT_UCHAR(m_pSBBase + ESSSB_REG_READDATA);
+    
+    for ( i = PcGetTimeInterval(TimeInterval); i < 2000000; i = PcGetTimeInterval(TimeInterval) )
+    {
+        if ( (READ_PORT_UCHAR(m_pSBBase + ESSSB_REG_STATUS) & 0x80) != 0 )
+            return READ_PORT_UCHAR(m_pSBBase + ESSSB_REG_READDATA);
+    }
+    
+    ASSERT("dspRead timeout!");
+    
+    return 0xFF;
+    
+}
+
+/*****************************************************************************
+ * CAdapterCommon::dspWrite()
+ *****************************************************************************
+ * Writes to the DSP
+ */
+STDMETHODIMP_(UCHAR)
+CAdapterCommon::
+dspWrite
+(
+    IN  UCHAR   Value
+)
+{
+    ULONGLONG TimeInterval, i;
+
+    PAGED_CODE();
+    
+    ASSERT(m_pSBBase);
+
+    TimeInterval = PcGetTimeInterval(0);
+    
+    if ( (READ_PORT_UCHAR(m_pSBBase + ESSSB_REG_WRITEDATA) & 0x80) == 0 )
+    {
+        WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_WRITEDATA, Value);
+        return TRUE;
+    }
+    
+    for ( i = PcGetTimeInterval(TimeInterval); i < 5000000; i = PcGetTimeInterval(TimeInterval) )
+    {
+        if ( (READ_PORT_UCHAR(m_pSBBase + ESSSB_REG_WRITEDATA) & 0x80) == 0 )
+        {
+            WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_WRITEDATA, Value);
+            return TRUE;
+        }
+        
+        ASSERT("dspWrite timeout");
+    }
+    
+    return FALSE;
+}
+
+/*****************************************************************************
+ * CAdapterCommon::StartESFM()
+ *****************************************************************************
+ * Starts up the ESS FM Module
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+StartESFM
+(   
+    IN  BOOLEAN     MidiActive
+)
+{
+    BYTE SerialMode;
+
+    PAGED_CODE();
+    
+    SerialMode = dspReadMixer(ESM_MIXER_SERIALMODE_CTL);
+    if ( MidiActive )
+        SerialMode &= ~0x10;
+    else
+        SerialMode |= 0x10;
+    dspWriteMixer(ESM_MIXER_SERIALMODE_CTL, SerialMode);
+    
+    SetDacToMidi(MidiActive);
+    
+    if ( MidiActive )
+    {
+        WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_POWER, READ_PORT_UCHAR((PUCHAR)ESSSB_REG_POWER) & (~0x20));
+        WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_FMHIGHADDR, 5);
+        KeStallExecutionProcessor(25);
+        // We want ESFM mode!
+        WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_FMLOWADDR + 1, 0x80);
+        KeStallExecutionProcessor(25);
+    }
+    else
+    {
+        WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_POWER, READ_PORT_UCHAR((PUCHAR)ESSSB_REG_POWER) | 0x20);
+    }
+}
+
+/*****************************************************************************
+ * CAdapterCommon::SetDacToMidi()
+ *****************************************************************************
+ * Set DAC to Midi Mode
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+SetDacToMidi
+(   
+    IN  BOOLEAN     MidiActive
+)
+{
+    PAGED_CODE();
+
+    m_MidiActive = MidiActive;
+    
+    if ( MidiActive )
+    {
+        dspWriteMixer(ESM_MIXER_MDR, dspReadMixer(ESM_MIXER_MDR) & (~0x01));
+        
+        if (m_pMixerVolumesOut)
+            dspWriteMixer(m_pMixerVolumesOut[1].Register, m_pMixerVolumesOut[1].Value);
+        
+        if (m_pMixerVolumesIn)
+            dspWriteMixer(m_pMixerVolumesIn[0].Register, m_pMixerVolumesIn[0].Value);
+    }
+    else if ( m_Flags & FLAG_IISON )
+    {
+        dspWriteMixer(ESM_MIXER_MDR, dspReadMixer(ESM_MIXER_MDR) | 0x01);
+
+        if (m_pMixerVolumesOut)
+            dspWriteMixer(m_pMixerVolumesOut[6].Register, m_pMixerVolumesOut[6].Value);
+
+        if (m_pMixerVolumesIn)
+            dspWriteMixer(m_pMixerVolumesIn[5].Register, m_pMixerVolumesIn[5].Value);
+    }
+}
+
+/*****************************************************************************
+ * CAdapterCommon::IsMidiActive()
+ *****************************************************************************
+ * Checks if Midi active 
  */
 STDMETHODIMP_(BOOLEAN)
 CAdapterCommon::
-WriteController
-(
-    IN      BYTE    Value
-)
-{
-    ASSERT(m_pWaveBase);
-
-    BOOLEAN     returnValue = FALSE;
-    ULONGLONG   startTime   = PcGetTimeInterval(0);
-
-    do
-    {
-        BYTE status = READ_PORT_UCHAR (m_pWaveBase + DSP_REG_WRITE);
-
-        if ((status & 0x80) == 0)
-        {
-            WRITE_PORT_UCHAR (m_pWaveBase + DSP_REG_WRITE, Value);
-
-            returnValue = TRUE;
-        }
-    } while ((PcGetTimeInterval(startTime) < GTI_MILLISECONDS(100)) &&
-              ! returnValue);
-
-    ASSERT(returnValue || !"WriteController timeout");
-
-    return returnValue;
-}
-
-/*****************************************************************************
- * CAdapterCommon::MixerRegWrite()
- *****************************************************************************
- * Writes a mixer register.
- */
-STDMETHODIMP_(void)
-CAdapterCommon::
-MixerRegWrite
-(
-    IN      BYTE    Index,
-    IN      BYTE    Value
-)
-{
-    ASSERT( m_pWaveBase );
-    BYTE actualIndex;
-
-    // only hit the hardware if we're in an acceptable power state
-    if( m_PowerState <= PowerDeviceD1 )
-    {
-        actualIndex = (BYTE) ((Index < 0x80) ? (Index + DSP_MIX_BASEIDX) : Index);
-    
-        WRITE_PORT_UCHAR (m_pWaveBase + DSP_REG_MIXREG, actualIndex);
-    
-        WRITE_PORT_UCHAR (m_pWaveBase + DSP_REG_MIXDATA, Value);
-    }
-
-    if(Index < DSP_MIX_MAXREGS)
-    {
-        MixerSettings[Index] = Value;
-    }
-}
-
-/*****************************************************************************
- * CAdapterCommon::MixerRegRead()
- *****************************************************************************
- * Reads a mixer register.
- */
-STDMETHODIMP_(BYTE)
-CAdapterCommon::
-MixerRegRead
-(
-    IN      BYTE    Index
-)
-{
-    if(Index < DSP_MIX_MAXREGS)
-    {
-        return MixerSettings[Index];
-    }
-
-    //
-    // Not in the cache? Read from HW directly.
-    //
-    // We need to make sure that we can access the HW directly for
-    // the volumes that can change externally.
-    // This is done here with passing an index outside of the cache.
-    // Since the an index=0 is actually DSP_MIX_BASEIDX which is less
-    // than the cache size (DSP_MIX_MAXREGS), you can access any volume
-    // directly with passing DSP_MIX_BASEIDX + index.
-    // You could also pass a flag - but we want to keep the changes
-    // minimal - or create a new function like MixerRegReadDirect().
-    //
-    WRITE_PORT_UCHAR (m_pWaveBase + DSP_REG_MIXREG, Index);
-    return READ_PORT_UCHAR (m_pWaveBase + DSP_REG_MIXDATA);
-}
-
-/*****************************************************************************
- * CAdapterCommon::MixerReset()
- *****************************************************************************
- * Resets the mixer
- */
-STDMETHODIMP_(void)
-CAdapterCommon::
-MixerReset
+IsMidiActive
 (   void
 )
 {
-    ASSERT(m_pWaveBase);
-
-    WRITE_PORT_UCHAR (m_pWaveBase + DSP_REG_MIXREG, DSP_MIX_DATARESETIDX);
-
-    WRITE_PORT_UCHAR (m_pWaveBase + DSP_REG_MIXDATA, 0);
-
-    RestoreMixerSettingsFromRegistry();
+    PAGED_CODE();
+    
+    return m_MidiActive;
 }
 
+BOOLEAN Is_MPU401_Ready(PUCHAR Port)
+{
+    int i;
+    
+    PAGED_CODE();
+    
+    for ( i = 0; (READ_PORT_UCHAR(Port + MPU401_REG_STATUS) & MPU401_DRR) != 0; i++ )
+    {
+        if (i >= 1000) return FALSE;
+    }
+    return TRUE;
+}
+
+
 /*****************************************************************************
- * CAdapterCommon::AcknowledgeIRQ()
+ * CAdapterCommon::SysExMessage()
  *****************************************************************************
- * Acknowledge interrupt request.
+ * Sends a vendor specific SysEx message
  */
+inline
 void
 CAdapterCommon::
-AcknowledgeIRQ
-(   void
+SysExMessage
+(   IN      BYTE    Command
 )
 {
-    ASSERT(m_pWaveBase);
-    READ_PORT_UCHAR (m_pWaveBase + DSP_REG_ACK16BIT);
-    READ_PORT_UCHAR (m_pWaveBase + DSP_REG_ACK8BIT);
+    if ( Is_MPU401_Ready(m_pMPU401Base) ) WRITE_PORT_UCHAR(m_pMPU401Base + MPU401_REG_COMMAND, 0xF0);
+    if ( Is_MPU401_Ready(m_pMPU401Base) ) WRITE_PORT_UCHAR(m_pMPU401Base + MPU401_REG_COMMAND, 0x00);
+    if ( Is_MPU401_Ready(m_pMPU401Base) ) WRITE_PORT_UCHAR(m_pMPU401Base + MPU401_REG_COMMAND, 0x00);
+    if ( Is_MPU401_Ready(m_pMPU401Base) ) WRITE_PORT_UCHAR(m_pMPU401Base + MPU401_REG_COMMAND, 0x7B);
+    if ( Is_MPU401_Ready(m_pMPU401Base) ) WRITE_PORT_UCHAR(m_pMPU401Base + MPU401_REG_COMMAND, Command);
+    if ( Is_MPU401_Ready(m_pMPU401Base) ) WRITE_PORT_UCHAR(m_pMPU401Base + MPU401_REG_COMMAND, 0xF7);
 }
 
 /*****************************************************************************
- * CAdapterCommon::ResetController()
+ * CAdapterCommon::Init689()
  *****************************************************************************
- * Resets the controller.
+ * Initialize the ES689.
  */
-STDMETHODIMP_(NTSTATUS)
+STDMETHODIMP_(void)
 CAdapterCommon::
-ResetController(void)
-{
-    NTSTATUS ntStatus = STATUS_UNSUCCESSFUL;
-
-    // write a 1 to the reset bit
-    WRITE_PORT_UCHAR (m_pWaveBase + DSP_REG_RESET,1);
-
-    // wait for  at least 3 microseconds
-    KeStallExecutionProcessor (5L);    // okay, 5us
-
-    // write a 0 to the reset bit
-    WRITE_PORT_UCHAR (m_pWaveBase + DSP_REG_RESET,0);
-
-    // hang out for 100us
-    KeStallExecutionProcessor (100L);
-    
-    // read the controller
-    BYTE ReadVal = ReadController ();
-
-    // check return value
-    if( ReadVal == BYTE(0xAA) )
-    {
-        ntStatus = STATUS_SUCCESS;
-    }
-
-    return ntStatus;
-}
-
-/*****************************************************************************
- * CAdapterCommon::RestoreMixerSettingsFromRegistry()
- *****************************************************************************
- * Restores the mixer settings based on settings stored in the registry.
- */
-STDMETHODIMP
-CAdapterCommon::
-RestoreMixerSettingsFromRegistry
+Init689
 (   void
 )
 {
-    PREGISTRYKEY    DriverKey;
-    PREGISTRYKEY    SettingsKey;
+    PAGED_CODE();
 
-    _DbgPrintF(DEBUGLVL_VERBOSE,("[RestoreMixerSettingsFromRegistry]"));
+    UCHAR PortData;
+
+    // Enable ES689 Interface
+    dspWriteMixer(ESM_MIXER_SERIALMODE_CTL, dspReadMixer(ESM_MIXER_SERIALMODE_CTL) | 0x10);
     
-    // open the driver registry key
-    NTSTATUS ntStatus = PcNewRegistryKey( &DriverKey,               // IRegistryKey
-                                          NULL,                     // OuterUnknown
-                                          DriverRegistryKey,        // Registry key type
-                                          KEY_ALL_ACCESS,           // Access flags
-                                          m_pDeviceObject,          // Device object
-                                          NULL,                     // Subdevice
-                                          NULL,                     // ObjectAttributes
-                                          0,                        // Create options
-                                          NULL );                   // Disposition
-    if(NT_SUCCESS(ntStatus))
+    // Disable MPU401 Interrupt (MPU401Int = 0)
+    PortData = dspReadMixer(ESM_MIXER_MASTER_VOL_CTL);
+    dspWriteMixer(ESM_MIXER_MASTER_VOL_CTL, PortData & ~(0x40));
+    
+    dspWrite(0xC6); // Enable extended mode command
+    dspWrite(0xBC);
+    dspWrite(0x36);
+    
+    // Reset
+    if ( Is_MPU401_Ready(m_pMPU401Base) )
     {
-        UNICODE_STRING  KeyName;
-        ULONG           Disposition;
-        
-        // make a unicode strong for the subkey name
-        RtlInitUnicodeString( &KeyName, L"Settings" );
-
-
-
-        // open the settings subkey
-        ntStatus = DriverKey->NewSubKey( &SettingsKey,              // Subkey
-                                         NULL,                      // OuterUnknown
-                                         KEY_ALL_ACCESS,            // Access flags
-                                         &KeyName,                  // Subkey name
-                                         REG_OPTION_NON_VOLATILE,   // Create options
-                                         &Disposition );
-        if(NT_SUCCESS(ntStatus))
-        {
-            ULONG   ResultLength;
-
-            if(Disposition == REG_CREATED_NEW_KEY)
-            {
-                // copy default settings
-                for(ULONG i = 0; i < SIZEOF_ARRAY(DefaultMixerSettings); i++)
-                {
-                    MixerRegWrite( DefaultMixerSettings[i].RegisterIndex,
-                                   DefaultMixerSettings[i].RegisterSetting );
-                }
-            } else
-            {
-                // allocate data to hold key info
-                PVOID KeyInfo = ExAllocatePool(PagedPool, sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(DWORD));
-                if(NULL != KeyInfo)
-                {
-                    // loop through all mixer settings
-                    for(UINT i = 0; i < SIZEOF_ARRAY(DefaultMixerSettings); i++)
-                    {
-                        // init key name
-                        RtlInitUnicodeString( &KeyName, DefaultMixerSettings[i].KeyName );
-        
-                        // query the value key
-                        ntStatus = SettingsKey->QueryValueKey( &KeyName,
-                                                               KeyValuePartialInformation,
-                                                               KeyInfo,
-                                                               sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(DWORD),
-                                                               &ResultLength );
-                        if(NT_SUCCESS(ntStatus))
-                        {
-                            PKEY_VALUE_PARTIAL_INFORMATION PartialInfo = PKEY_VALUE_PARTIAL_INFORMATION(KeyInfo);
-    
-                            if(PartialInfo->DataLength == sizeof(DWORD))
-                            {
-                                // set mixer register to registry value
-                                MixerRegWrite( DefaultMixerSettings[i].RegisterIndex,
-                                               BYTE(*(PDWORD(PartialInfo->Data))) );
-                            }
-                        } else
-                        {
-                            // if key access failed, set to default
-                            MixerRegWrite( DefaultMixerSettings[i].RegisterIndex,
-                                           DefaultMixerSettings[i].RegisterSetting );
-                        }
-                    }
-    
-                    // free the key info
-                    ExFreePool(KeyInfo);
-                } else
-                {
-                    // copy default settings
-                    for(ULONG i = 0; i < SIZEOF_ARRAY(DefaultMixerSettings); i++)
-                    {
-                        MixerRegWrite( DefaultMixerSettings[i].RegisterIndex,
-                                       DefaultMixerSettings[i].RegisterSetting );
-                    }
-
-                    ntStatus = STATUS_INSUFFICIENT_RESOURCES;
-                }
-            }
-
-            // release the settings key
-            SettingsKey->Release();
-        }
-
-        // release the driver key
-        DriverKey->Release();
-
+        WRITE_PORT_UCHAR(m_pMPU401Base + MPU401_REG_COMMAND, MPU401_CMD_RESET);
+        READ_PORT_UCHAR(m_pMPU401Base + MPU401_REG_DATA);
     }
 
-    return ntStatus;
+    // Enter UART mode
+    if ( Is_MPU401_Ready(m_pMPU401Base) )
+    {
+        WRITE_PORT_UCHAR(m_pMPU401Base + MPU401_REG_COMMAND, MPU401_CMD_UART);
+        READ_PORT_UCHAR(m_pMPU401Base + MPU401_REG_DATA);
+    }
+
+    SysExMessage(0x01);
+    SysExMessage(0x04);
+    SysExMessage(0x06);
+    KeStallExecutionProcessor(50);
+    
+    // Reset
+    if ( Is_MPU401_Ready(m_pMPU401Base) )
+    {
+        WRITE_PORT_UCHAR(m_pMPU401Base + MPU401_REG_COMMAND, MPU401_CMD_RESET);
+        READ_PORT_UCHAR(m_pMPU401Base + MPU401_REG_DATA);
+    }
+
+    // Re-enable MPU401 Interrupt
+    dspWriteMixer(ESM_MIXER_MASTER_VOL_CTL, PortData);
 }
 
 /*****************************************************************************
- * CAdapterCommon::SaveMixerSettingsToRegistry()
+ * CAdapterCommon::Enable_Irq()
  *****************************************************************************
- * Saves the mixer settings to the registry.
+ * Enable required Interrupts
  */
-STDMETHODIMP
+STDMETHODIMP_(void)
 CAdapterCommon::
-SaveMixerSettingsToRegistry
+Enable_Irq
 (   void
 )
 {
-    PREGISTRYKEY    DriverKey;
-    PREGISTRYKEY    SettingsKey;
+    UCHAR IrqMask;
 
-    _DbgPrintF(DEBUGLVL_VERBOSE,("[SaveMixerSettingsToRegistry]"));
+    IrqMask = A1IRQ | A2IRQ ;
+    if ( m_Flags & FLAG_HWVOLUMEON ) IrqMask |= HVIRQ;
+    if ( bMPU401IntEnable ) IrqMask |= MPUIRQ;
+    WRITE_PORT_UCHAR(m_pIOBase + ESSIO_REG_IRQCONTROL, IrqMask);
+}
+
+/*****************************************************************************
+ * CAdapterCommon::StartDma()
+ *****************************************************************************
+ * Start of DMA 
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+StartDma
+(
+    IN      BOOLEAN    Capture,
+    IN      ULONG      DMAChannelAddress,
+    IN      ULONG      BufferSize,
+    IN      BOOLEAN    Format16Bit,
+    IN      BOOLEAN    FormatStereo,
+    IN      ULONG      NotificationInterval,
+    IN      ULONG      SamplingFrequency
+)
+{
+    ULONG BufferSizeCalc, DMATransferCountReload, BufferSizePerChan;
+    BYTE Control;
+    int i;
+
+    PAGED_CODE();
+
+    BufferSizePerChan = Format16Bit ? BufferSize / 2 : BufferSize;
+    BufferSizeCalc = SamplingFrequency * NotificationInterval / 1000;
+    if ( FormatStereo ) BufferSizeCalc *= 2;
+    if ( BufferSizeCalc > BufferSizePerChan) BufferSizeCalc = BufferSizePerChan;
+    DMATransferCountReload = 0x10001 - BufferSizeCalc;
     
-    // open the driver registry key
-    NTSTATUS ntStatus = PcNewRegistryKey( &DriverKey,               // IRegistryKey
-                                          NULL,                     // OuterUnknown
-                                          DriverRegistryKey,        // Registry key type
-                                          KEY_ALL_ACCESS,           // Access flags
-                                          m_pDeviceObject,          // Device object
-                                          NULL,                     // Subdevice
-                                          NULL,                     // ObjectAttributes
-                                          0,                        // Create options
-                                          NULL );                   // Disposition
-    if(NT_SUCCESS(ntStatus))
+    if ( Capture )
     {
-        UNICODE_STRING  KeyName;
+        WRITE_PORT_UCHAR(m_pDMABase + ESSDM_REG_DMAMASK, 1); // Mask the DREQ
         
-        // make a unicode strong for the subkey name
-        RtlInitUnicodeString( &KeyName, L"Settings" );
+        WRITE_PORT_UCHAR(m_pDMABase + ESSDM_REG_DMAMODE, ESSDM_DMAMODE_AI | ESSDM_DMAMODE_TTYPE_WRITE);
+        WRITE_PORT_USHORT((PUSHORT)(m_pDMABase + ESSDM_REG_DMAADDR), (USHORT)DMAChannelAddress);
+        WRITE_PORT_USHORT((PUSHORT)(m_pDMABase + ESSDM_REG_DMAADDR + 2), HIWORD(DMAChannelAddress));
+        WRITE_PORT_USHORT((PUSHORT)(m_pDMABase + ESSDM_REG_DMACOUNT), (USHORT)BufferSize - 1);
+        WRITE_PORT_USHORT((PUSHORT)(m_pDMABase + ESSDM_REG_DMACOUNT + 2), 0);
+        
+        WRITE_PORT_UCHAR(m_pDMABase + ESSDM_REG_DMAMASK, 0); // Unmask the DREQ
+        
+        WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_RESET, 2);
+        WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_RESET, 0);
+        
+        dspWrite(ESS_CMD_ENABLEEXT);
+        
+        dspWrite(ESS_CMD_DMATYPE);
+        dspWrite(2);
+        
+        dspWrite(ESS_CMD_DMACNTRELOADL);
+        dspWrite(LOBYTE(DMATransferCountReload));
+        dspWrite(ESS_CMD_DMACNTRELOADH);
+        dspWrite(HIBYTE(DMATransferCountReload));
 
-        // open the settings subkey
-        ntStatus = DriverKey->NewSubKey( &SettingsKey,              // Subkey
-                                         NULL,                      // OuterUnknown
-                                         KEY_ALL_ACCESS,            // Access flags
-                                         &KeyName,                  // Subkey name
-                                         REG_OPTION_NON_VOLATILE,   // Create options
-                                         NULL );
-        if(NT_SUCCESS(ntStatus))
-        {
-            // loop through all mixer settings
-            for(UINT i = 0; i < SIZEOF_ARRAY(MixerSettings); i++)
-            {
-                // init key name
-                RtlInitUnicodeString( &KeyName, DefaultMixerSettings[i].KeyName );
+        dspWrite(ESS_CMD_READREG);
+        dspWrite(ESS_CMD_DMACONTROL);
+        Control = dspRead() & 0x30 | 0x0E;
+        dspWrite(ESS_CMD_DMACONTROL);
+        dspWrite(Control);
+        
+        dspWrite(ESS_CMD_READREG);
+        dspWrite(ESS_CMD_ANALOGCONTROL);
+        Control = dspRead() & 8 | 0xF4;
+        if ( FormatStereo ) Control |= 1; else Control |= 2;
+        dspWrite(ESS_CMD_ANALOGCONTROL);
+        dspWrite(Control);
+        
+        dspWrite(ESS_CMD_READREG);
+        dspWrite(ESS_CMD_IRQCONTROL);
+        Control = dspRead() | 0x50;
+        dspWrite(ESS_CMD_IRQCONTROL);
+        dspWrite(Control);
+        
+        dspWrite(ESS_CMD_READREG);
+        dspWrite(ESS_CMD_DRQCONTROL);
+        Control = dspRead() | 0x50;
+        dspWrite(ESS_CMD_DRQCONTROL);
+        dspWrite(Control);
 
-                // set the key
-                DWORD KeyValue = DWORD(MixerSettings[DefaultMixerSettings[i].RegisterIndex]);
-                ntStatus = SettingsKey->SetValueKey( &KeyName,                 // Key name
-                                                     REG_DWORD,                // Key type
-                                                     PVOID(&KeyValue),
-                                                     sizeof(DWORD) );
-                if(!NT_SUCCESS(ntStatus))
-                {
-                    break;
-                }
-            }
-
-            // release the settings key
-            SettingsKey->Release();
-        }
-
-        // release the driver key
-        DriverKey->Release();
-
+        Control = FormatStereo ? 0x98 : 0xD0;
+        if ( Format16Bit ) Control |= 0x24;
+        dspWrite(ESS_CMD_SETFORMAT2);
+        dspWrite(Control);
+        
+        dspWrite(ESS_CMD_READREG);
+        dspWrite(ESS_CMD_DMACONTROL);
+        Control = dspRead() | 1;
+        dspWrite(ESS_CMD_DMACONTROL);
+        dspWrite(Control);
+        
+        m_DmaStarted = TRUE;
+        for (i=0; i<8; i++) KeStallExecutionProcessor(50);
     }
+    else
+    {
+        UCHAR Mode;
+        
+        Mode = READ_PORT_UCHAR(m_pIOBase + ESSIO_REG_AUDIO2MODE);
+        WRITE_PORT_UCHAR(m_pIOBase + ESSIO_REG_AUDIO2MODE, Mode & (~(ESSA2M_AIEN | ESSA2M_DMAEN)));
+        WRITE_PORT_USHORT((PUSHORT)(m_pIOBase + ESSIO_REG_AUDIO2DMAADDR), LOWORD(DMAChannelAddress));
+        WRITE_PORT_USHORT((PUSHORT)(m_pIOBase + ESSIO_REG_AUDIO2DMAADDR + 2), HIWORD(DMAChannelAddress));
+        WRITE_PORT_USHORT((PUSHORT)(m_pIOBase + ESSDM_REG_DMACOUNT), (USHORT)BufferSize);
+        
+        dspWriteMixer(ESM_MIXER_AUDIO2_TCOUNT + 0, LOBYTE(DMATransferCountReload));
+        dspWriteMixer(ESM_MIXER_AUDIO2_TCOUNT + 2, HIBYTE(DMATransferCountReload));
+        
+        Control = Format16Bit ? 5 : 0;
+        if ( FormatStereo ) Control |= 2;
+        dspWriteMixer(ESM_MIXER_AUDIO2_CTL2, Control | 0x40);
+        dspWriteMixer(ESM_MIXER_AUDIO2_MODE, dspReadMixer(ESM_MIXER_AUDIO2_MODE) | 0x32);
+        dspWriteMixer(ESM_MIXER_AUDIO2_CTL1, 0x93);
+        WRITE_PORT_UCHAR(m_pIOBase + ESSIO_REG_AUDIO2MODE, Mode | (ESSA2M_AIEN | ESSA2M_DMAEN));
+    }
+}
 
-    return ntStatus;
+
+/*****************************************************************************
+ * CAdapterCommon::PauseDma()
+ *****************************************************************************
+ * Pauses DMA transfer
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+PauseDma
+(
+    IN      BOOLEAN    Capture
+)
+{
+    BYTE Control;
+    
+    PAGED_CODE();
+
+    if ( Capture )
+    {
+        dspWrite(ESS_CMD_READREG);
+        dspWrite(ESS_CMD_DMACONTROL);
+        Control = dspRead() & (~0x04);
+        dspWrite(ESS_CMD_DMACONTROL);
+        dspWrite(Control);
+
+        dspWrite(ESS_CMD_READREG);
+        dspWrite(ESS_CMD_DMACONTROL);
+        Control = dspRead() & (~0x01);
+        dspWrite(ESS_CMD_DMACONTROL);
+        dspWrite(Control);
+    }
+    else
+    {
+        WRITE_PORT_UCHAR(m_pIOBase + ESSIO_REG_AUDIO2MODE, 
+            READ_PORT_UCHAR(m_pIOBase + ESSIO_REG_AUDIO2MODE) & (~(ESSA2M_AIEN | ESSA2M_DMAEN)));
+        dspWriteMixer(ESM_MIXER_AUDIO2_CTL1, dspReadMixer(ESM_MIXER_AUDIO2_MODE) & (~0x10));
+    }
+}    
+
+/*****************************************************************************
+ * CAdapterCommon::StopDma()
+ *****************************************************************************
+ * Stops DMA transfer
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+StopDma
+(
+    IN      BOOLEAN    Capture
+)
+{   
+    int i;
+
+    PAGED_CODE();
+
+    if ( Capture )
+    {
+        WRITE_PORT_UCHAR(m_pDMABase + ESSDM_REG_DMAMASK, 1); // Mask the DREQ
+        READ_PORT_UCHAR(m_pSBBase + ESSSB_REG_READDATA);
+        READ_PORT_UCHAR(m_pSBBase + ESSSB_REG_STATUS);
+        m_DmaStarted = FALSE;
+    }
+    else
+    {
+        WRITE_PORT_UCHAR(m_pIOBase + ESSIO_REG_AUDIO2MODE, 
+            READ_PORT_UCHAR(m_pIOBase + ESSIO_REG_AUDIO2MODE) & (~(ESSA2M_AIEN | ESSA2M_DMAEN)));
+        dspWriteMixer(ESM_MIXER_AUDIO2_CTL1, dspReadMixer(ESM_MIXER_AUDIO2_MODE) & (~0x10));
+        
+        for (i=0; i<20; i++) KeStallExecutionProcessor(50);
+        
+        dspWriteMixer(ESM_MIXER_AUDIO2_CTL1, 0);
+        dspWriteMixer(ESM_MIXER_AUDIO2_CTL2, dspReadMixer(ESM_MIXER_AUDIO2_CTL2) & (~0x80));
+    }
+}    
+
+/*****************************************************************************
+ * CAdapterCommon::SetDspBase()
+ *****************************************************************************
+ * Set DSP base address
+ */
+STDMETHODIMP_(PUCHAR)
+CAdapterCommon::
+SetDspBase
+(
+    IN      PUCHAR  DspBase
+)
+{
+    PUCHAR ret;
+    
+    PAGED_CODE();
+    
+    ret = m_pSBBase;
+    m_pSBBase = DspBase;
+    return ret;
 }
 
 /*****************************************************************************
@@ -756,9 +1555,10 @@ PowerChangeState
     IN      POWER_STATE     NewState
 )
 {
-    UINT i;
+    PAGED_CODE();
 
-    _DbgPrintF( DEBUGLVL_VERBOSE, ("[CAdapterCommon::PowerChangeState]"));
+    if ( NewState.DeviceState > PowerDeviceD0 )
+        NewState.DeviceState = PowerDeviceD3;
 
     // Is this actually a state change?
     if( NewState.DeviceState != m_PowerState )
@@ -767,62 +1567,42 @@ PowerChangeState
         switch( NewState.DeviceState )
         {
             case PowerDeviceD0:
-                // Insert your code here for entering the full power state (D0).
-                // This code may be a function of the current power state.  Note that
-                // property accesses such as volume and mute changes may occur when
-                // the device is in a sleep state (D1-D3) and should be cached in the
-                // driver to be restored upon entering D0.  However, it should also be
-                // noted that new miniport and new streams will only be attempted at
-                // D0 -- PortCls will place the device in D0 prior to the NewStream call.
-
-                // Save the new state.  This local value is used to determine when to cache
-                // property accesses and when to permit the driver from accessing the hardware.
-                m_PowerState = NewState.DeviceState;
-
-                // restore mixer settings
-                for(i = 0; i < DSP_MIX_MAXREGS - 1; i++)
+                dspReset();
+                dspWriteMixer(ESM_MIXER_OPAMP_CALIB, 1);
+                Enable_Irq();
+                WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_FMHIGHADDR, 5);
+                KeStallExecutionProcessor(25);
+                WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_FMLOWADDR + 1, 0x80);
+                KeStallExecutionProcessor(25);
+                WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_MIXERADDR, 0x64);
+                if ( (READ_PORT_UCHAR(m_pSBBase + ESSSB_REG_MIXERDATA) & 0x10) )
                 {
-                    if( i != DSP_MIX_MICVOLIDX )
-                    {
-                        MixerRegWrite( BYTE(i), MixerSettings[i] );
-                    }
+                    WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_MIXERADDR, 0x66);
+                    WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_MIXERDATA, 0x66);
                 }
-
-                if (m_WaveMiniportSB16)
-                {
-                    m_WaveMiniportSB16->RestoreSampleRate();
-                }
+                RestoreConfig();
                 break;
 
-            case PowerDeviceD1:
-                // This sleep state is the lowest latency sleep state with respect to the
-                // latency time required to return to D0.  The driver can still access
-                // the hardware in this state if desired.  If the driver is not being used
-                // an inactivity timer in PortCls will place the driver in this state after
-                // a timeout period controllable via the registry.
-                
-            case PowerDeviceD2:
-                // This is a medium latency sleep state.  In this state the device driver
-                // cannot assume that it can touch the hardware so any accesses need to be
-                // cached and the hardware restored upon entering D0 (or D1 conceivably).
-                
             case PowerDeviceD3:
                 // This is a full hibernation state and is the longest latency sleep state.
                 // The driver cannot access the hardware in this state and must cache any
-                // hardware accesses and restore the hardware upon returning to D0 (or D1).
-                
-                // Save the new state.
-                m_PowerState = NewState.DeviceState;
+                // hardware accesses and restore the hardware upon returning to D0 (or D1).                               
 
-                _DbgPrintF(DEBUGLVL_VERBOSE,("  Entering D%d",ULONG(m_PowerState)-ULONG(PowerDeviceD0)));
+                SaveConfig();
+                WRITE_PORT_UCHAR(m_pIOBase + ESSIO_REG_IRQCONTROL, 0);
                 break;
     
             default:
-                _DbgPrintF(DEBUGLVL_VERBOSE,("  Unknown Device Power State"));
                 break;
         }
+        
+
+        // Save the new state.  This local value is used to determine when to cache
+        // property accesses and when to permit the driver from accessing the hardware.
+        m_PowerState = NewState.DeviceState;
     }
 }
+
 
 /*****************************************************************************
  * CAdapterCommon::QueryPowerChangeState()
@@ -837,7 +1617,11 @@ QueryPowerChangeState
     IN      POWER_STATE     NewStateQuery
 )
 {
-    _DbgPrintF( DEBUGLVL_TERSE, ("[CAdapterCommon::QueryPowerChangeState]"));
+    UNREFERENCED_PARAMETER(NewStateQuery);
+
+    PAGED_CODE();
+    
+    _DbgPrintF( DEBUGLVL_TERSE, ("QueryPowerChangeState"));
 
     // Check here to see of a legitimate state is being requested
     // based on the device state and fail the call if the device/driver
@@ -863,9 +1647,373 @@ QueryDeviceCapabilities
     IN      PDEVICE_CAPABILITIES    PowerDeviceCaps
 )
 {
-    _DbgPrintF( DEBUGLVL_TERSE, ("[CAdapterCommon::QueryDeviceCapabilities]"));
+    UNREFERENCED_PARAMETER(PowerDeviceCaps);
 
-    return STATUS_SUCCESS;
+    PAGED_CODE();
+    
+    _DbgPrintF( DEBUGLVL_TERSE, ("QueryDeviceCapabilities"));
+
+    return STATUS_UNSUCCESSFUL;
+}
+
+/*****************************************************************************
+ * CAdapterCommon::DRM_SetFlags()
+ *****************************************************************************
+ * Sets the DRM flags
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+DRM_SetFlags
+(
+    IN      BOOL    Mute,
+    IN      BOOL    DigitalOutputDisable
+)
+{
+    UNREFERENCED_PARAMETER(DigitalOutputDisable);
+
+    if ( (RunTime & RUNTIME_FLAG_NODRM) == 0 && m_MuteInput != Mute )
+    {
+        m_MuteInput = Mute;
+        dspWriteMixer(ESM_MIXER_EXTENDEDRECSRC, dspReadMixer(ESM_MIXER_EXTENDEDRECSRC));
+    }
+}
+
+/*****************************************************************************
+ * CAdapterCommon::RestoreConfig()
+ *****************************************************************************
+ * Restores saved card configuration
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+RestoreConfig
+(   void
+)
+{
+    int i;
+    
+    PAGED_CODE();
+    
+    for (i=0; i<sizeof(SavedConfig)/sizeof(SavedConfig[0]); i++)
+    {
+        AccessConfigSpace(m_pDeviceObject, FALSE, &SavedConfig[i].Data, SavedConfig[i].Offset, sizeof(SavedConfig[i].Data));
+    }
+    
+    dspWrite(ESS_CMD_ENABLEEXT);
+    
+    for (i=0; i<sizeof(ConfigSettings)/sizeof(ConfigSettings[0]); i++)
+    {
+        if ( ConfigSettings[i].IsMixer )
+            dspWriteMixer(ConfigSettings[i].s.Register, ConfigSettings[i].s.Value);
+        else
+        {
+            dspWrite((UCHAR)ConfigSettings[i].s.Register);
+            dspWrite((UCHAR)ConfigSettings[i].s.Value);
+        }
+    }
+    
+    dspWriteMixer(ESM_MIXER_SERIALMODE_CTL, dspReadMixer(ESM_MIXER_SERIALMODE_CTL) | 0x10);
+    if (!NoJoy)
+    {
+        DWORD Data = 0x201;
+        
+        AccessConfigSpace(m_pDeviceObject, FALSE, &Data, ESM_GAMEPORT, sizeof(Data));
+    }
+}
+
+/*****************************************************************************
+ * CAdapterCommon::SaveConfig()
+ *****************************************************************************
+ * Restores saved card configuration
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+SaveConfig
+(   void
+)
+{
+    int i;
+    
+    PAGED_CODE();
+    
+    for (i=0; i<sizeof(SavedConfig)/sizeof(SavedConfig[0]); i++)
+    {
+        AccessConfigSpace(m_pDeviceObject, TRUE, &SavedConfig[i].Data, SavedConfig[i].Offset, sizeof(SavedConfig[i].Data));
+    }
+    
+    dspWrite(ESS_CMD_ENABLEEXT);
+    
+    for (i=0; i<sizeof(ConfigSettings)/sizeof(ConfigSettings[0]); i++)
+    {
+        if ( ConfigSettings[i].IsMixer )
+            ConfigSettings[i].s.Value = dspReadMixer(ConfigSettings[i].s.Register);
+        else
+        {
+            dspWrite(ESS_CMD_READREG);
+            dspWrite((UCHAR)ConfigSettings[i].s.Register);
+            ConfigSettings[i].s.Value = dspRead();
+        }
+    }
+}
+
+/*****************************************************************************
+ * CAdapterCommon::SetClkRunEnable()
+ *****************************************************************************
+ * Enable clock
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+SetClkRunEnable
+(
+    IN      BOOLEAN    Enable
+)
+{   
+    UNREFERENCED_PARAMETER(Enable);
+
+    PAGED_CODE();
+
+}    
+
+/*****************************************************************************
+ * CAdapterCommon::SetRecordingSource()
+ *****************************************************************************
+ * Sets a new recording source
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+SetRecordingSource
+(
+    IN      PDWORD     RecordingSource
+)
+{   
+    PAGED_CODE();
+
+    m_pRecordingSource = RecordingSource;
+}    
+
+/*****************************************************************************
+ * CAdapterCommon::BoardId()
+ *****************************************************************************
+ * Get the Board ID of the current sound board
+ */
+STDMETHODIMP_(DWORD)
+CAdapterCommon::
+BoardId
+(   void
+)
+{
+    PAGED_CODE();
+    
+    return m_BoardId;
+}
+
+/*****************************************************************************
+ * CAdapterCommon::IsRecording()
+ *****************************************************************************
+ * Check if recording
+ */
+STDMETHODIMP_(BOOL)
+CAdapterCommon::
+IsRecording
+(   void
+)
+{
+    PAGED_CODE();
+    
+    return m_Recording;
+}
+
+/*****************************************************************************
+ * CAdapterCommon::StartRecording()
+ *****************************************************************************
+ * Starts recording
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+StartRecording
+(
+    IN      BOOLEAN    Recording
+)
+{   
+    SETTING *pMixerTables;
+    BYTE Control;
+    unsigned int i;
+    
+    PAGED_CODE();
+
+    if (Recording)
+        pMixerTables = m_pMixerVolumesIn;
+    else
+    {
+        dspReset();
+        pMixerTables = m_pMixerVolumesOut;
+    }
+    
+    for (i=0; i<10; i++)
+    {
+        if (m_Recording)
+        {
+            switch (i)
+            {
+                case 0:
+                    if (!IsMidiActive()) break;
+                case 1:
+                case 2:
+                case 3:
+                case 4:
+                    if ( *m_pRecordingSource == i + 1 )
+                        dspWriteMixer(pMixerTables[i].Register, pMixerTables[i].Value);
+                    break;
+                case 5:
+                    if ( *m_pRecordingSource == i + 1 && !IsMidiActive() )
+                        dspWriteMixer(pMixerTables[i].Register, pMixerTables[i].Value);
+                    break;
+                case 6:
+                    if ( *m_pRecordingSource == i + 1 )
+                    {
+                        dspWrite(ESS_CMD_ENABLEEXT);
+                        dspWrite(ESS_CMD_RECLEVEL);
+                        dspWrite(pMixerTables[i].Value);
+                        dspWriteMixer(ESM_MIXER_AUDIO1_VOL, 0);
+                    }
+                    break;
+                case 7:
+                    dspWrite(ESS_CMD_ENABLEEXT);
+                    dspWrite(ESS_CMD_READREG);
+                    dspWrite(ESS_CMD_ANALOGCONTROL);
+                    Control = dspRead() | 0x70;
+                    if (*m_pRecordingSource == i || pMixerTables[i].Value == 0)
+                        Control &= ~8;
+                    else
+                        Control |= 8;
+                    dspWrite(ESS_CMD_ANALOGCONTROL);
+                    dspWrite(Control);
+                    break;
+                default:
+                    if (pMixerTables[i].Register)
+                        dspWriteMixer(pMixerTables[i].Register, pMixerTables[i].Value);
+                    break;
+            }
+        }
+        else
+        {
+            if ( (i == 1 && IsMidiActive()) || (i == 6 && !IsMidiActive()) || pMixerTables[i].Register )
+                dspWriteMixer(pMixerTables[i].Register, pMixerTables[i].Value);
+        }
+    }
+}
+
+/*****************************************************************************
+ * CAdapterCommon::SetMixerTables()
+ *****************************************************************************
+ * Sets the Mixer tables
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+SetMixerTables
+(
+        IN      PUCHAR     Table1,
+        IN      PUCHAR     Table0
+)
+{   
+    PAGED_CODE();
+    
+    m_pMixerVolumesOut = (SETTING*)Table1;
+    m_pMixerVolumesIn = (SETTING*)Table0;
+}
+
+/*****************************************************************************
+ * CAdapterCommon::GetDeviceID()
+ *****************************************************************************
+ * Get the Board ID of the current sound board
+ */
+STDMETHODIMP_(USHORT)
+CAdapterCommon::
+GetDeviceID
+(   void
+)
+{
+    return m_DeviceID;
+}
+
+
+/*****************************************************************************
+ * CAdapterCommon::GetPosition()
+ *****************************************************************************
+ * Get the current position
+ */
+STDMETHODIMP_(USHORT)
+CAdapterCommon::
+GetPosition
+(
+    IN      BOOLEAN    Capture,
+    IN      UINT       DmaBufferSize
+)
+{
+    int i, j;
+    USHORT Pos;
+
+    if ( !Capture )
+        return READ_PORT_USHORT((PUSHORT)(m_pIOBase + ESSIO_REG_AUDIO2DMACOUNT));
+    
+    WRITE_PORT_UCHAR(m_pDMABase + ESSDM_REG_DMAMASK, 1);
+
+    for (i=0; i<6; i++)
+    {
+        for (j=0; j<10; j++)
+            READ_PORT_USHORT((PUSHORT)(m_pDMABase + ESSDM_REG_DMACOUNT));
+        Pos = READ_PORT_USHORT((PUSHORT)(m_pDMABase + ESSDM_REG_DMACOUNT));
+        if (DmaBufferSize - Pos - 1 < DmaBufferSize ) break;
+    }
+    if (i >= 6) Pos = 0;
+    
+    WRITE_PORT_UCHAR(m_pDMABase + ESSDM_REG_DMAMASK, 0);
+
+    return Pos;
+}
+
+
+
+#pragma code_seg()
+
+/*****************************************************************************
+ * CAdapterCommon::dspReadMixer()
+ *****************************************************************************
+ * Reads from the Mixer
+ */
+STDMETHODIMP_(UCHAR)
+CAdapterCommon::
+dspReadMixer
+(
+    IN  UCHAR   Address
+)
+{
+    WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_MIXERADDR, Address);
+    return READ_PORT_UCHAR(m_pSBBase + ESSSB_REG_MIXERDATA);
+}
+
+
+/*****************************************************************************
+ * CAdapterCommon::dspWriteMixer()
+ *****************************************************************************
+ * Writes to the Mixer
+ */
+STDMETHODIMP_(void)
+CAdapterCommon::
+dspWriteMixer
+(
+    IN  UCHAR Address,
+    IN  UCHAR Value
+)
+{
+    if (Address == ESM_MIXER_EXTENDEDRECSRC)
+    {
+        if (m_MuteInput)
+            Value |= 0x10;
+        else
+            Value &= ~0x10;
+    }
+    WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_MIXERADDR, Address);
+    WRITE_PORT_UCHAR(m_pSBBase + ESSSB_REG_MIXERDATA, Value);
 }
 
 /*****************************************************************************
@@ -880,67 +2028,60 @@ InterruptServiceRoutine
     IN      PVOID           DynamicContext
 )
 {
-    ASSERT(InterruptSync);
+    UCHAR MixerAddr, Control;
+    
+    UNREFERENCED_PARAMETER(InterruptSync);
     ASSERT(DynamicContext);
 
     CAdapterCommon *that = (CAdapterCommon *) DynamicContext;
 
-    //
-    // We are here because the MPU tried and failed, so
-    // must be a wave interrupt.
-    //
-    ASSERT(that->m_pWaveBase);
-
-    //
-    // Read the Interrupt status register.
-    //
-    BYTE IntrStatus = that->MixerRegRead (0x82);
-
-    //
-    // In case we really read the interrupt status register, we should
-    // also USE it and make sure that we really have a wave interrupt
-    // and not something else!
-    //
-    if (IntrStatus & 0x03)      // Voice8 or Voice16 Interrupt
+    Control = READ_PORT_UCHAR(that->m_pIOBase + ESSIO_REG_IRQCONTROL);
+    if ( Control == 0xFF || (Control & 0xF0) == 0 )
+        return STATUS_UNSUCCESSFUL;   
+    if (!that->m_pSBBase) return STATUS_SUCCESS;
+    
+    MixerAddr = READ_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERADDR);
+    WRITE_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERADDR, ESM_MIXER_MASTER_VOL_CTL);
+    if ((READ_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERDATA) & 0x10) == 0)
     {
-        //
-        // Make sure there is a wave miniport.
-        //
-        if (that->m_WaveMiniportSB16)
+        if (that->m_pPortWave && that->m_pWaveServiceGroup)
+            that->m_pPortWave->Notify(that->m_pWaveServiceGroup);
+        WRITE_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERADDR, ESM_MIXER_AUDIO2_CTL2);
+        Control = READ_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERDATA);
+        if (!(Control & 0x80))
         {
-            //
-            // Tell it it needs to do some work.
-            //
-            that->m_WaveMiniportSB16->ServiceWaveISR ();
+            READ_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_STATUS);
         }
-    
-        //
-        // ACK the ISR.
-        //
-        that->AcknowledgeIRQ();
-    }
-    
-#ifdef EVENT_SUPPORT
-    //
-    // This code will fire a volume event in case the HW volume has changed.
-    //
-    else if (IntrStatus & 0x10)      // Volume interrupt on C16X-mixers
-    {
-        //
-        // Ack vol interrupt
-        //
-        IntrStatus &= ~0x10;
-        that->MixerRegWrite (0x82, IntrStatus);
-
-        //
-        // Generate an event for the master volume (as an example)
-        //
-        if (that->m_TopoMiniportSB16)
+        else
         {
-            that->m_TopoMiniportSB16->ServiceEvent ();
+            WRITE_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERADDR, ESM_MIXER_AUDIO2_CTL2);
+            WRITE_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERDATA, Control & (~0x80));
+        }
+        WRITE_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERADDR, MixerAddr);
+        return STATUS_SUCCESS;
+    }
+
+    WRITE_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERADDR, ESM_MIXER_CLRHWVOLIRQ);
+    WRITE_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERDATA, ESM_MIXER_CLRHWVOLIRQ);
+    WRITE_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERADDR, ESM_MIXER_CLRHWVOLIRQ);
+    Control = READ_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERDATA) & 0x40;
+    WRITE_PORT_UCHAR(that->m_pSBBase + ESSSB_REG_MIXERADDR, MixerAddr);
+    
+    if (that->m_pPortEvents)
+    {
+        if (Control == that->m_MuteOutput )
+        {
+            that->m_pPortEvents->GenerateEventList(NULL, KSEVENT_CONTROL_CHANGE, FALSE, 
+                ULONG(-1), TRUE, LINEOUT_VOL);
+            that->m_HardwareVolumeFlag |= 2;
+        }
+        else
+        {
+            that->m_pPortEvents->GenerateEventList(NULL, KSEVENT_CONTROL_CHANGE, FALSE, 
+                ULONG(-1), TRUE, LINEOUT_MUTE);
+            that->m_HardwareVolumeFlag = Control == 0 ? 3 : 1;
         }
     }
-#endif
     
-    return STATUS_SUCCESS;
+    return 1;  // BUGBUG?
 }

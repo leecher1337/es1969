@@ -1,7 +1,5 @@
 /*++
 
-Copyright (c) 1992  Microsoft Corporation
-
 Module Name:
 
     devcaps.c
@@ -12,7 +10,7 @@ Abstract:
 
 Author:
 
-    Robin Speed (RobinSp) 20-Oct-1992
+    leecher1337
 
 Environment:
 
@@ -36,8 +34,8 @@ Revision History:
 #endif
 
 // non-localized strings version is wrong !!!
-WCHAR STR_SNDBLST10[] = L"Creative Labs Sound Blaster 1.0";
-WCHAR STR_SNDBLST15[] = L"Creative Labs Sound Blaster 1.5";
+WCHAR STR_MIDIOUT_PNAME[] = L"ESS AudioDrive MIDI port Output";
+WCHAR STR_MIDIIN_PNAME[] = L"ESS AudioDrive MIDI port Input";
 
 
 NTSTATUS
@@ -87,38 +85,19 @@ Return Value:
     // fill in the info
     //
 
-    wc.wMid = MM_MICROSOFT;
+    wc.wMid = MM_ESS;
     wc.vDriverVersion = DRIVER_VERSION;
 
-    if (SB16(&pGDI->Hw)) {
-        wc.wPid = MM_MSFT_SB16_WAVEOUT;
-        wc.dwFormats = WAVE_FORMAT_1M08 | WAVE_FORMAT_1S08 |
-                       WAVE_FORMAT_1M16 | WAVE_FORMAT_1S16 |
-                       WAVE_FORMAT_2M08 | WAVE_FORMAT_2S08 |
-                       WAVE_FORMAT_2M16 | WAVE_FORMAT_2S16 |
-                       WAVE_FORMAT_4M08 | WAVE_FORMAT_4S08 |
-                       WAVE_FORMAT_4M16;
-        if (pGDI->DmaChannel16 != 0xFFFFFFFF) {
-            wc.dwFormats |= WAVE_FORMAT_4S16;
-        }
-        wc.wChannels = 2;
-        wc.dwSupport = WAVECAPS_VOLUME | WAVECAPS_LRVOLUME;
+    wc.wPid = MM_ESS_AMWAVEOUT;
+    wc.dwFormats = WAVE_FORMAT_1M08 | WAVE_FORMAT_1S08 |
+                   WAVE_FORMAT_1M16 | WAVE_FORMAT_1S16 |
+                   WAVE_FORMAT_2M08 | WAVE_FORMAT_2S08 |
+                   WAVE_FORMAT_2M16 | WAVE_FORMAT_2S16 |
+                   WAVE_FORMAT_4M08 | WAVE_FORMAT_4S08 |
+                   WAVE_FORMAT_4M16 | WAVE_FORMAT_4S16;
+    wc.wChannels = 2;
+    wc.dwSupport = WAVECAPS_VOLUME | WAVECAPS_LRVOLUME | WAVECAPS_SAMPLEACCURATE;
 
-    } else {
-        wc.wPid = MM_MSFT_SBPRO_WAVEOUT;
-        if (SBPRO(&pGDI->Hw)) {
-            wc.dwSupport = WAVECAPS_VOLUME |
-                           WAVECAPS_LRVOLUME;
-            wc.dwFormats = WAVE_FORMAT_1M08 | WAVE_FORMAT_1S08 |
-                           WAVE_FORMAT_2M08 | WAVE_FORMAT_2S08 |
-                           WAVE_FORMAT_4M08 ;
-            wc.wChannels = 2 ;
-        } else {
-            wc.dwSupport = 0;
-            wc.dwFormats = WAVE_FORMAT_1M08 | WAVE_FORMAT_2M08;
-            wc.wChannels = 1;
-        }
-    }
 
     //
     // Copy across the product name - we just provide the string id
@@ -182,33 +161,17 @@ Return Value:
     // fill in the info
     //
 
-    wc.wMid = MM_MICROSOFT;
+    wc.wMid = MM_ESS;
     wc.vDriverVersion = DRIVER_VERSION;
 
-    if (SB16(&pGDI->Hw)) {
-        wc.wPid = MM_MSFT_SB16_WAVEIN;
-        wc.dwFormats = WAVE_FORMAT_1M08 | WAVE_FORMAT_1S08 |
-                       WAVE_FORMAT_1M16 | WAVE_FORMAT_1S16 |
-                       WAVE_FORMAT_2M08 | WAVE_FORMAT_2S08 |
-                       WAVE_FORMAT_2M16 | WAVE_FORMAT_2S16 |
-                       WAVE_FORMAT_4M08 | WAVE_FORMAT_4S08 |
-                       WAVE_FORMAT_4M16;
-        if (pGDI->DmaChannel16 != 0xFFFFFFFF) {
-            wc.dwFormats |= WAVE_FORMAT_4S16;
-        }
-        wc.wChannels = 2;
-    } else {
-        wc.wPid = MM_MSFT_SBPRO_WAVEIN;
-        if (SBPRO(&pGDI->Hw)) {
-           wc.dwFormats = WAVE_FORMAT_1M08 | WAVE_FORMAT_1S08 |
-                          WAVE_FORMAT_2M08 | WAVE_FORMAT_2S08 |
-                          WAVE_FORMAT_4M08 ;
-           wc.wChannels = 2 ;
-        } else {
-           wc.dwFormats = WAVE_FORMAT_1M08 ;
-           wc.wChannels = 1 ;
-        }
-    }
+    wc.wPid = MM_ESS_AMWAVEIN;
+    wc.dwFormats = WAVE_FORMAT_1M08 | WAVE_FORMAT_1S08 |
+                   WAVE_FORMAT_1M16 | WAVE_FORMAT_1S16 |
+                   WAVE_FORMAT_2M08 | WAVE_FORMAT_2S08 |
+                   WAVE_FORMAT_2M16 | WAVE_FORMAT_2S16 |
+                   WAVE_FORMAT_4M08 | WAVE_FORMAT_4S08 |
+                   WAVE_FORMAT_4M16 | WAVE_FORMAT_4S16;
+    wc.wChannels = 2;
 
     //
     // Copy across the product name - we just provide the string id
@@ -273,9 +236,8 @@ Return Value:
     // fill in the info
     //
 
-    mc.wMid = MM_MICROSOFT;
-    mc.wPid = (USHORT)(SB16(&pGDI->Hw) ? MM_MSFT_SB16_SYNTH :
-                                         MM_MSFT_SBPRO_SYNTH);
+    mc.wMid = MM_ESS;
+    mc.wPid = MM_ESS_AMSYNTH;
     mc.wTechnology = MOD_FMSYNTH;
     mc.wVoices = 128;
     mc.wNotes = 18;
@@ -344,8 +306,8 @@ Return Value:
     // fill in the info
     //
 
-    mc.wMid = MM_MICROSOFT;
-    mc.wPid = MM_MSFT_SBPRO_MIDIOUT;
+    mc.wMid = MM_ESS;
+    mc.wPid = MM_ESS_AMMIDIOOUT;
     mc.vDriverVersion = DRIVER_VERSION;
     mc.wTechnology = MOD_MIDIPORT;
     mc.wVoices = 0;                   // not used for ports
@@ -353,12 +315,7 @@ Return Value:
     mc.wChannelMask = 0xFFFF;         // all channels
     mc.dwSupport = 0L;
 
-    if (SB1(&pGDI->Hw)) {
-        RtlCopyMemory(mc.szPname, STR_SNDBLST10, sizeof(STR_SNDBLST10));
-    } else {
-        RtlCopyMemory(mc.szPname, STR_SNDBLST15, sizeof(STR_SNDBLST15));
-    }
-
+    RtlCopyMemory(mc.szPname, STR_MIDIOUT_PNAME, sizeof(STR_MIDIOUT_PNAME));
 
     RtlCopyMemory(pIrp->AssociatedIrp.SystemBuffer,
                   &mc,
@@ -417,17 +374,11 @@ Return Value:
     // fill in the info
     //
 
-    mc.wMid = MM_MICROSOFT;
-    mc.wPid = MM_MSFT_SBPRO_MIDIIN;
-    mc.wPid = MM_SNDBLST_MIDIIN;
+    mc.wMid = MM_ESS;
+    mc.wPid = MM_ESS_AMMIDIIN;
     mc.vDriverVersion = DRIVER_VERSION;
 
-    if (SB1(&pGDI->Hw)) {
-        RtlCopyMemory(mc.szPname, STR_SNDBLST10, sizeof(STR_SNDBLST10));
-    } else {
-        RtlCopyMemory(mc.szPname, STR_SNDBLST15, sizeof(STR_SNDBLST15));
-    }
-
+    RtlCopyMemory(mc.szPname, STR_MIDIIN_PNAME, sizeof(STR_MIDIIN_PNAME));
 
     RtlCopyMemory(pIrp->AssociatedIrp.SystemBuffer,
                   &mc,
@@ -484,28 +435,8 @@ Return Value:
     // fill in the info
     //
 
-    auxCaps.wMid = MM_MICROSOFT;
-    switch (pLDI->DeviceIndex) {
-    case LineInDevice:
-        auxCaps.wPid = (USHORT)(SB16(&pGDI->Hw) ? MM_MSFT_SB16_AUX_LINE :
-                                                  MM_MSFT_SBPRO_AUX_LINE);
-        //
-        // Copy across the product name - we just provide the string id
-        //
-
-        *(PULONG)auxCaps.szPname = IDS_AUX_LINE_PNAME;
-        break;
-
-    case CDInternal:
-        auxCaps.wPid = (USHORT)(SB16(&pGDI->Hw) ? MM_MSFT_SB16_AUX_CD :
-                                                  MM_MSFT_SBPRO_AUX_CD);
-        //
-        // Copy across the product name - we just provide the string id
-        //
-
-        *(PULONG)auxCaps.szPname = IDS_AUX_CD_PNAME;
-        break;
-    }
+    auxCaps.wMid = MM_ESS;
+    auxCaps.wPid = MM_ESS_AMAUX;
     auxCaps.vDriverVersion = DRIVER_VERSION;
     auxCaps.wTechnology = AUXCAPS_AUXIN;
     auxCaps.dwSupport = AUXCAPS_LRVOLUME | AUXCAPS_VOLUME;
@@ -521,7 +452,8 @@ Return Value:
 
 NTSTATUS SoundQueryFormat(
     IN    PLOCAL_DEVICE_INFO pLDI,
-    IN    PPCMWAVEFORMAT pFormat
+    IN    PPCMWAVEFORMAT pFormat,
+    IN    ULONG IoControlCode
 )
 /*++
 
@@ -543,6 +475,7 @@ Return Value:
 --*/
 {
     PGLOBAL_DEVICE_INFO pGDI;
+    DWORD nMaxSamplesPerSec = 44100;
 
     pGDI = pLDI->pGlobalInfo;
 
@@ -551,84 +484,18 @@ Return Value:
         return STATUS_NOT_SUPPORTED;
     }
 
-    if (SB16(&pGDI->Hw)) {
-        if (pFormat->wBitsPerSample != 8 && pFormat->wBitsPerSample != 16 ||
-            pFormat->wf.nSamplesPerSec < 5000 ||
-            pFormat->wf.nSamplesPerSec > 44100) {
-            return STATUS_NOT_SUPPORTED;
-        } else {
-            if (pGDI->DmaChannel16 == 0xFFFFFFFF &&
-                pFormat->wf.nSamplesPerSec > 25000 &&
-                pFormat->wBitsPerSample == 16 &&
-                pFormat->wf.nChannels == 2) {
+    if (pLDI->pGlobalInfo->Hw.DSPVersion == 6249 || pLDI->pGlobalInfo->Hw.DSPVersion == 6265)
+        nMaxSamplesPerSec = 44100;
 
-                /*  Too fast for an 8-bit channel */
-                return STATUS_NOT_SUPPORTED;
-            }
-            return STATUS_SUCCESS;
-        }
-    }
-
-    if (pFormat->wBitsPerSample != 8 ||
-        pFormat->wf.nSamplesPerSec < 4000) {
+    if (pFormat->wBitsPerSample != 8 && pFormat->wBitsPerSample != 16 ||
+        pFormat->wf.nSamplesPerSec < 4000 ||
+        pFormat->wf.nSamplesPerSec > nMaxSamplesPerSec ||
+        ((pLDI->pGlobalInfo->Hw.DSPVersion == 6248 || pLDI->pGlobalInfo->Hw.DSPVersion == 6264) && 
+         IoControlCode == IOCTL_WDMAUD_REMOVE_DEVNODE && !FdxFormatCheck(pLDI, pFormat)) {
         return STATUS_NOT_SUPPORTED;
-    }
-
-    if (SBPRO(&pGDI->Hw)) {
-        if (pFormat->wf.nSamplesPerSec > 44100 ||
-            pFormat->wf.nChannels == 2 &&
-            pFormat->wf.nSamplesPerSec != 11025 &&
-            pFormat->wf.nSamplesPerSec != 22050) {
-            return STATUS_NOT_SUPPORTED;
-        } else {
-            if (pGDI->MidiInUse) {
-                if (HwHighSpeed(&pGDI->Hw,
-                                (ULONG)pFormat->wf.nChannels,
-                                pFormat->wf.nSamplesPerSec,
-                                (BOOLEAN)(pLDI->DeviceType == WAVE_OUT))) {
-                    return STATUS_NOT_SUPPORTED;
-                }
-            }
-            return STATUS_SUCCESS;
-        }
-    }
-
-    if (pFormat->wf.nChannels != 1) {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    if (SB201(&pGDI->Hw)) {
-        if (pFormat->wf.nSamplesPerSec > 44100 ||
-            pLDI->DeviceType == WAVE_IN &&
-            pFormat->wf.nSamplesPerSec > 15000) {
-            return STATUS_NOT_SUPPORTED;
-        } else {
-            if (pGDI->MidiInUse) {
-                if (HwHighSpeed(&pGDI->Hw,
-                                (ULONG)pFormat->wf.nChannels,
-                                pFormat->wf.nSamplesPerSec,
-                                (BOOLEAN)(pLDI->DeviceType == WAVE_OUT))) {
-                    return STATUS_NOT_SUPPORTED;
-                }
-            }
-            return STATUS_SUCCESS;
-        }
-    }
-
-
-    if (pLDI->DeviceType == WAVE_IN) {
-        if (pFormat->wf.nSamplesPerSec > 13000) {
-            return STATUS_NOT_SUPPORTED;
-        } else {
-            return STATUS_SUCCESS;
-        }
-    }
-
-    if (pFormat->wf.nSamplesPerSec > 23000) {
-        return STATUS_NOT_SUPPORTED;
-    } else {
-        return STATUS_SUCCESS;
-    }
+    } 
+    
+    return STATUS_SUCCESS;
 }
 
 

@@ -21,426 +21,28 @@
 
 #include "mmddk.h"
 #include "driver.h"
+#include "natv.h"
 
-#include "adlib.h"
-#include "opl3.h"
-
+/* typedefs for MIDI patches */
+#define PATCH_SIZE              8258
 
 /***********************************************************
 global memory */
 
 
 PORTALLOC gMidiInClient;     // input client information structure
-DWORD dwRefTime;             // time when midi input was opened
 
-DWORD dwMsgTime;             // timestamp (in ms) of current msg
-DWORD dwMsg = 0L;            // short midi message
-BYTE  bBytesLeft = 0;        // number of bytes needed to complete message
-BYTE  bBytePos = 0;          // position in short message buffer
-DWORD dwCurData = 0L;        // position in long message buffer
-BOOL  fSysex = FALSE;        // are we in sysex mode?
 BYTE  status = 0;
-BYTE    fMidiInStarted = 0;     /* has the midi been started */
-LPMIDIHDR      lpMIQueue = NULL;
 BYTE    gbMidiInUse = 0;                /* if MIDI is in use */
 
 static WORD  wMidiOutEntered = 0;    // reentrancy check
 static PORTALLOC gMidiOutClient;     // client information
 
-/* transformation of linear velocity value to
-        logarithmic attenuation */
-BYTE gbVelocityAtten[32] = {
-        40, 36, 32, 28, 23, 21, 19, 17,
-        15, 14, 13, 12, 11, 10, 9, 8,
-        7, 6, 5, 5, 4, 4, 3, 3,
-        2, 2, 1, 1, 1, 0, 0, 0 };
 
-BYTE BCODE gbPercMap[53][2] =
-{
-   {  0, 35 },
-   {  0, 35 },
-   {  2, 52 },
-   {  3, 48 },
-   {  4, 58 },
-   {  5, 60 },
-   {  6, 47 },
-   {  7, 43 },
-   {  6, 49 },
-   {  9, 43 },
-   {  6, 51 },
-   { 11, 43 },
-   {  6, 54 },
-   {  6, 57 },
-   { 14, 72 },
-   {  6, 60 },
-   { 16, 76 },
-   { 17, 84 },
-   { 18, 36 },
-   { 19, 76 },
-   { 20, 84 },
-   { 21, 83 },
-   { 22, 84 },
-   { 23, 24 },
-   { 16, 77 },
-   { 25, 60 },
-   { 26, 65 },
-   { 27, 59 },
-   { 28, 51 },
-   { 29, 45 },
-   { 30, 71 },
-   { 31, 60 },
-   { 32, 58 },
-   { 33, 53 },
-   { 34, 64 },
-   { 35, 71 },
-   { 36, 61 },
-   { 37, 61 },
-   { 38, 48 },
-   { 39, 48 },
-   { 40, 69 },
-   { 41, 68 },
-   { 42, 63 },
-   { 43, 74 },
-   { 44, 60 },
-   { 45, 80 },
-   { 46, 64 },
-   { 47, 69 },
-   { 48, 73 },
-   { 49, 75 },
-   { 50, 68 },
-   { 51, 48 },
-   { 52, 53 }
-} ;
-
-short   giBend[NUMCHANNELS];    /* bend for each channel */
-BYTE    gbPatch[NUMCHANNELS];   /* patch number mapped to */
+BYTE * gBankMem = NULL;  /* points to the patches */
 
 /* --- interface functions ---------------------------------- */
 
-
-/*
- * the functions in this section call out to adlib.c or opl3.c
- * depending on which device we have installed.
- */
-
-
-/**************************************************************
-MidiAllNotesOff - switch off all active voices.
-
-inputs - none
-returns - none
-*/
-VOID MidiAllNotesOff(void)
-{
-    switch (gMidiType) {
-    case TYPE_OPL3:
-        Opl3_AllNotesOff();
-        break;
-
-    case TYPE_ADLIB:
-        Adlib_AllNotesOff();
-        break;
-    }
-}
-
-
-/**************************************************************
-MidiNewVolume - This should be called if a volume level
-        has changed. This will adjust the levels of all the playing
-        voices.
-
-inputs
-        WORD    wLeft   - left attenuation (1.5 db units)
-        WORD    wRight  - right attenuation (ignore if mono)
-returns
-        none
-*/
-VOID FAR PASCAL MidiNewVolume (WORD wLeft, WORD wRight)
-{
-    switch (gMidiType) {
-    case TYPE_OPL3:
-        Opl3_NewVolume(wLeft, wRight);
-        break;
-
-    case TYPE_ADLIB:
-        Adlib_NewVolume(wLeft, wRight);
-        break;
-    }
-
-}
-
-/***************************************************************
-MidiChannelVolume - set the volume level for an individual channel.
-
-inputs
-        BYTE    bChannel - channel number to change
-        WORD    wAtten  - attenuation in 1.5 db units
-
-returns
-        none
-*/
-VOID FAR PASCAL MidiChannelVolume(BYTE bChannel, WORD wAtten)
-{
-
-    switch (gMidiType) {
-    case TYPE_OPL3:
-        Opl3_ChannelVolume(bChannel, wAtten);
-        break;
-
-    case TYPE_ADLIB:
-        Adlib_ChannelVolume(bChannel, wAtten);
-        break;
-    }
-
-}
-
-
-
-/***************************************************************
-MidiSetPan - set the left-right pan position.
-
-inputs
-        BYTE    bChannel  - channel number to alter
-        BYTE    bPan   - 0 for left, 127 for right or somewhere in the middle.
-
-returns - none
-*/
-VOID FAR PASCAL MidiSetPan(BYTE bChannel, BYTE bPan)
-{
-    switch (gMidiType) {
-    case TYPE_OPL3:
-        Opl3_SetPan(bChannel, bPan);
-        break;
-
-    case TYPE_ADLIB:
-        Adlib_SetPan(bChannel, bPan);
-        break;
-    }
-
-}
-
-/***************************************************************
-MidiPitchBend - This pitch bends a channel.
-
-inputs
-        BYTE    bChannel - channel
-        short   iBend - Values from -32768 to 32767, being
-                        -2 to +2 half steps
-returns
-        none
-*/
-VOID NEAR PASCAL MidiPitchBend (BYTE bChannel,
-        short iBend)
-{
-    switch (gMidiType) {
-    case TYPE_OPL3:
-        Opl3_PitchBend(bChannel, iBend);
-        break;
-
-    case TYPE_ADLIB:
-        Adlib_PitchBend(bChannel, iBend);
-        break;
-    }
-
-}
-
-/***************************************************************
-MidiBoardInit - initialise board and load patches as necessary.
-
-* inputs - none
-* returns - 0 for success or the error code
-*/
-WORD MidiBoardInit(void)
-{
-    /*
-     * load patch tables and reset board
-     */
-
-    switch (gMidiType) {
-    case TYPE_OPL3:
-        return( Opl3_BoardInit());
-        break;
-
-    case TYPE_ADLIB:
-        return (Adlib_BoardInit());
-        break;
-    }
-    return(MMSYSERR_ERROR);
-}
-
-/*
- * MidiBoardReset - silence the board and set all voices off.
- */
-VOID MidiBoardReset(void)
-{
-    BYTE i;
-
-    /*
-     * switch off pitch bend (we own this, not the opl3/adlib code)
-     */
-    for (i = 0; i < NUMCHANNELS; i++)
-        giBend[i] = 0;
-
-    /*
-     * set all voices off, set channel atten to default,
-     * & silence board.
-     */
-    switch (gMidiType) {
-    case TYPE_OPL3:
-        Opl3_BoardReset();
-        break;
-
-    case TYPE_ADLIB:
-        Adlib_BoardReset();
-        break;
-    }
-}
-
-
-
-/* --- midi interpretation -------------------------------------*/
-
-
-/***************************************************************
-MidiMessage - This handles a MIDI message. This
-        does not do running status.
-
-inputs
-        DWORD dwData - up to 4 bytes of MIDI data
-                depending upon the message.
-returns
-        none
-*/
-VOID NEAR PASCAL MidiMessage (DWORD dwData)
-{
-    BYTE    bChannel, bVelocity, bNote;
-    WORD    wTemp;
-
-    // D1("\nMidiMessage");
-    bChannel = (BYTE) dwData & (BYTE)0x0f;
-    bVelocity = (BYTE) (dwData >> 16) & (BYTE)0x7f;
-    bNote = (BYTE) ((WORD) dwData >> 8) & (BYTE)0x7f;
-
-    switch ((BYTE)dwData & 0xf0) {
-        case 0x90:
-#ifdef DEBUG
-            {
-                    char szTemp[4];
-                    szTemp[0] = "0123456789abcdef"[bNote >> 4];
-                    szTemp[1] = "0123456789abcdef"[bNote & 0x0f];
-                    szTemp[2] = ' ';
-                    szTemp[3] = 0;
-                    if ((bChannel == 9) && bVelocity) D1(szTemp);
-            }
-#endif
-            /* turn key on, or key off if volume == 0 */
-            if (bVelocity) {
-                switch(gMidiType) {
-                case TYPE_OPL3:
-                    if (bChannel == DRUMCHANNEL)
-                    {
-                       if (bNote >= 35 && bNote <= 87)
-                       {
-#ifdef DEBUG
-                          char szDebug[ 80 ] ;
-
-                          wsprintf( szDebug, "bChannel = %d, bNote = %d",
-                                    bChannel, bNote ) ;
-                          D1( szDebug ) ;
-#endif
-
-                          Opl3_NoteOn( (BYTE) (gbPercMap[ bNote - 35 ][ 0 ] + 0x80),
-                                       gbPercMap[ bNote - 35 ][ 1 ],
-                                       bChannel, bVelocity,
-                                       (short) giBend[ bChannel ] ) ;
-                       }
-                    }
-                    else
-                        Opl3_NoteOn( (BYTE) gbPatch[ bChannel ], bNote, bChannel,
-                                     bVelocity, (short) giBend[ bChannel ] ) ;
-                    break;
-
-                case TYPE_ADLIB:
-                    Adlib_NoteOn (
-                            (BYTE) ((bChannel == DRUMCHANNEL) ?
-                                    (BYTE) (bNote + 128) : (BYTE) gbPatch[bChannel]),
-                            bNote, bChannel, bVelocity, (short) giBend[bChannel]);
-                    break;
-                }
-                break;
-            }
-
-                /* else, continue through and turn key off */
-        case 0x80:
-                /* turn key off */
-                switch (gMidiType) {
-                case TYPE_OPL3:
-                    if (bChannel == DRUMCHANNEL)
-                    {
-                       if (bNote >= 35 && bNote <= 87)
-                          Opl3_NoteOff( (BYTE) (gbPercMap[ bNote - 35 ][ 0 ] + 0x80),
-                                       gbPercMap[ bNote - 35 ][ 1 ], bChannel ) ;
-                    }
-                    else
-                       Opl3_NoteOff( (BYTE) gbPatch[bChannel], bNote, bChannel ) ;
-                    break;
-
-                case TYPE_ADLIB:
-                    Adlib_NoteOff (
-                            (BYTE) ((bChannel == DRUMCHANNEL) ?
-                                    (BYTE) (bNote + 128) : (BYTE) gbPatch[bChannel]),
-                                    bNote, bChannel);
-                    break;
-                }
-                break;
-
-        case 0xb0:
-                // D1("\nChangeControl");
-                /* change control */
-                switch (bNote) {
-                        case 7:
-                                /* change channel volume */
-                                MidiChannelVolume(
-                                    bChannel,
-                                    gbVelocityAtten[(bVelocity & 0x7f) >> 2]);
-
-                                break;
-                        case 8:
-                        case 10:
-                                /* change the pan level */
-                                MidiSetPan(bChannel, bVelocity);
-                                break;
-                        };
-                break;
-
-        case 0xc0:
-            if (bChannel != DRUMCHANNEL)
-            {
-               int  i ;
-
-               // Turn off all active notes for this channel...
-
-               if (gMidiType == TYPE_OPL3) {
-                   Opl3_ChannelNotesOff(bChannel);
-               }
-
-               gbPatch[ bChannel ] = bNote ;
-
-            }
-            break;
-
-        case 0xe0:
-                // D1("\nBend");
-                /* pitch bend */
-                wTemp = ((WORD) bVelocity << 9) | ((WORD) bNote << 2);
-                giBend[bChannel] = (short) (WORD) (wTemp + 0x7FFF);
-                MidiPitchBend (bChannel, giBend[bChannel]);
-
-                break;
-    };
-
-    return;
-}
 
 /****************************************************************************
  * @doc INTERNAL
@@ -471,55 +73,6 @@ void NEAR PASCAL midiSynthCallback(NPPORTALLOC pPort, WORD msg, DWORD dw1, DWORD
             dw1,                     // first DWORD
             dw2);                    // second DWORD
 }
-
-/****************************************************************************
- * @doc INTERNAL
- *
- * @api void | midBufferWrite | This function writes a byte into the long
- *     message buffer.  If the buffer is full or a SYSEX_ERROR or
- *     end-of-sysex byte is received, the buffer is marked as 'done' and
- *     it's owner is called back.
- *
- * @parm BYTE | byte | The byte received.
- *
- * @rdesc There is no return value
- ***************************************************************************/
-static void NEAR PASCAL midBufferWrite(BYTE byte)
-{
-    LPMIDIHDR  lpmh;
-    WORD       msg;
-
-    // if no buffers, nothing happens
-    if (lpMIQueue == NULL)
-        return;
-
-    lpmh = lpMIQueue;
-
-    if (byte == SYSEX_ERROR) {
-        D2(("sysexerror"));
-        msg = MIM_LONGERROR;
-        }
-    else {
-        D2(("bufferwrite"));
-        msg = MIM_LONGDATA;
-        *((HPSTR)(lpmh->lpData) + dwCurData++) = byte;
-        }
-
-    // if end of sysex, buffer full or error, send them back the buffer
-    if ((byte == SYSEX_ERROR) || (byte == 0xF7) || (dwCurData >= lpmh->dwBufferLength)) {
-        D2(("bufferdone"));
-        lpMIQueue = lpMIQueue->lpNext;
-        lpmh->dwBytesRecorded = dwCurData;
-        dwCurData = 0L;
-        lpmh->dwFlags |= MHDR_DONE;
-        lpmh->dwFlags &= ~MHDR_INQUEUE;
-        midiSynthCallback(&gMidiInClient, msg, (DWORD)lpmh, dwMsgTime);
-    }
-
-    return;
-}
-
-
 
 /****************************************************************************
 
@@ -785,6 +338,39 @@ DWORD APIENTRY modSynthMessage(UINT id,
 return MMSYSERR_NOTSUPPORTED;
 }
 
+#ifdef LOAD_PATCHES
+static TCHAR BCODE gszIniKeyPatchLib[]       = INI_STR_PATCHLIB;
+static TCHAR BCODE gszIniDrvSection[]        = INI_DRIVER;
+static TCHAR BCODE gszIniDrvFile[]           = INI_SOUND;
+static TCHAR BCODE gszSysIniSection[]        = TEXT("synth.dll");
+static TCHAR BCODE gszSysIniFile[]           = TEXT("System.Ini");
+
+/** static DWORD NEAR PASCAL DrvGetProfileString(LPSTR szKeyName, LPSTR szDef, LPSTR szBuf, UINT wBufLen)
+ *
+ *  DESCRIPTION:
+ *
+ *
+ *  ARGUMENTS:
+ *      (LPSTR szKeyName, LPSTR szDef, LPSTR szBuf, WORD wBufLen)
+ *              HINT    wSystem - if TRUE write/read to system.ini
+ *
+ *  RETURN (static DWORD NEAR PASCAL):
+ *
+ *
+ *  NOTES:
+ *
+ ** cjp */
+
+static DWORD NEAR PASCAL DrvGetProfileString(LPTSTR szKeyName, LPTSTR szDef, LPTSTR szBuf, UINT wBufLen,
+        UINT wSystem)
+{
+    return GetPrivateProfileString(wSystem ? gszSysIniSection : gszIniDrvSection, szKeyName, szDef,
+                szBuf, wBufLen, wSystem ? gszSysIniFile : gszIniDrvFile);
+} /* DrvGetProfileString() */
+#endif // LOAD_PATCHES
+
+
+
 /****************************************************************
 MidiInit - Initializes the FM synthesis chip and internal
         variables. This assumes that HwInit() has been called
@@ -798,22 +384,92 @@ returns
 */
 WORD FAR PASCAL MidiInit (VOID)
 {
-//    WORD        i;
+    HANDLE      hFile;
+    DWORD       dwRead;
+    TCHAR       szPatchLib[STRINGLEN];     /* patch libarary */
 
     D1 (("\nMidiInit"));
 
-// don't reset the patch map - it will be initialised at loadtime to 0
-// (because its static data) and we should not change it after that
-// since the mci sequencer will not re-send patch change messages.
-//
-//
-//    /* reset all channels to patch 0 */
-//    for (i = 0; i < NUMCHANNELS; i++) {
-//      gbPatch[i] = 0;
-//    }
+    /* Check we haven't already initialized */
+    if (gBankMem != NULL) {
+        return 0;
+    }
 
-    /* initialise the h/w specific patch tables */
-    return MidiBoardInit();
+
+    /* allocate the memory, and fill it up from the patch
+     * library.
+     */
+    gBankMem = (BYTE*)GlobalLock(GlobalAlloc(GMEM_MOVEABLE|GMEM_SHARE|GMEM_ZEROINIT, PATCH_SIZE));
+    if (!gBankMem) {
+        D1 (("Opl3_Init: could not allocate patch container memory!"));
+        return ERROR_OUTOFMEMORY;
+    }
+
+#ifdef LOAD_PATCHES
+    /* should the load patches be moved to the init section? */
+    DrvGetProfileString(gszIniKeyPatchLib, TEXT(""),
+        szPatchLib, sizeof(szPatchLib), FALSE);
+
+
+
+   if (lstrcmpi( (LPTSTR) szPatchLib, TEXT("") ) == 0)
+#endif // LOAD_PATCHES
+   {
+      HRSRC   hrsrcPatches ;
+      HGLOBAL hPatches ;
+      LPTSTR  lpPatches ;
+
+      hrsrcPatches =
+         FindResource( hDriverModule1, MAKEINTRESOURCE( DATA_FMPATCHES ),
+                       RT_BINARY ) ;
+
+      if (NULL != hrsrcPatches)
+      {
+         hPatches = LoadResource( hDriverModule1, hrsrcPatches ) ;
+         lpPatches = LockResource( hPatches ) ;
+         AsMemCopy( gBankMem, lpPatches,
+                    PATCH_SIZE ) ;
+         UnlockResource( hPatches ) ;
+         FreeResource( hPatches ) ;
+      }
+      else
+      {
+         TCHAR  szAlert[ 50 ] ;
+         TCHAR  szErrorBuffer[ 255 ] ;
+
+         LoadString( hDriverModule1, SR_ALERT, szAlert, sizeof( szAlert ) / sizeof(TCHAR)) ;
+         LoadString( hDriverModule1, SR_ALERT_NORESOURCE, szErrorBuffer,
+                     sizeof( szErrorBuffer ) / sizeof(TCHAR) ) ;
+         MessageBox( NULL, szErrorBuffer, szAlert, MB_OK|MB_ICONHAND ) ;
+      }
+   }
+#ifdef LOAD_PATCHES
+   else
+   {
+
+    hFile = CreateFile (szPatchLib, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile) {
+        if (!ReadFile (hFile, gBankMem, PATCH_SIZE, &dwRead, NULL)) {
+            D1(("Bad ReadFile"));
+        }
+
+        CloseHandle (hFile, 0);
+    } else {
+
+        TCHAR   szAlert[50];
+        TCHAR   szErrorBuffer[255];
+
+        LoadString(hDriverModule1, SR_ALERT, szAlert, sizeof(szAlert));
+        LoadString(hDriverModule1, SR_ALERT_NOPATCH, szErrorBuffer, sizeof(szErrorBuffer));
+        MessageBox(NULL, szErrorBuffer, szAlert, MB_OK|MB_ICONHAND);
+        D1 (("Bad mmioOpen"));
+    }
+
+   }
+#endif // LOAD_PATCHES
+
+
+    return 0;       /* done */
 }
 
 
@@ -848,7 +504,7 @@ UINT FAR PASCAL MidiOpen (VOID)
     /*
      * reset the device (set default channel attenuation etc)
      */
-    MidiBoardReset();
+    fmreset();
 
     return 0;
 }
@@ -898,11 +554,8 @@ void FAR PASCAL MidiReset(void)
 
     D1(("MidiReset"));
 
-    /* make sure all notes turned off */
-    MidiAllNotesOff();
-
     /* silence the board and reset board-specific variables */
-    MidiBoardReset();
+    fmreset();
 
 
 } /* MidiReset() */

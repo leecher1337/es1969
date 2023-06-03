@@ -7,14 +7,14 @@
  ***************************************************************************/
 
 
-#define STR_DRIVERNAME TEXT("sndblst")
+#define STR_DRIVERNAME TEXT("auddrive")
 
 //
 // General config stuff
 //
 
 #include <soundcfg.h>
-#include <sndblst.h>                // Shared with kernel driver
+#include <auddrive.h>                // Shared with kernel driver
 
 //
 // Patch stuff (support synthlib)
@@ -38,7 +38,7 @@
 //
 // Driver Version
 //
-#define DRIVER_VERSION          0x0100      // 1.00
+#define DRIVER_VERSION          0x0200      // 2.00
 
 //
 // New return code
@@ -52,7 +52,7 @@
 
  ***************************************************************************/
 
-HANDLE     ghModule;            /* our module handle                       */
+HANDLE     hDriverModule1;            /* our module handle                       */
 REG_ACCESS RegAccess;           /* Handles to registry and services        */
 BOOL       bInstall;            /* Tell config we're on an install         */
 HINSTANCE  hInstSetupAPI;
@@ -69,8 +69,6 @@ extern int      Config(HWND hWnd, HANDLE hInstance);
 extern LRESULT  ConfigRemove(HWND hDlg);
 extern int      ConfigDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam);
 extern void cdecl  ConfigErrorMsgBox(HWND hDlg, UINT StringId, ...);
-extern DWORD    InstallPnPDevice(IN HDEVINFO DeviceInfoSet,
-                                 IN PSP_DEVINFO_DATA DeviceInfoData);
 
 /* drvproc.c */
 extern LRESULT  DriverProc(DWORD dwDriverID, HDRVR hDriver, UINT uiMessage, LPARAM lParam1, LPARAM lParam2);

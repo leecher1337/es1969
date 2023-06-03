@@ -437,6 +437,7 @@ Return Value:
     ULONG Length;
     PSYNTH_DATA pData;
     PUCHAR SynthBase;
+    static USHORT PortData[2] ={0};
 
     Length = pIrpStack->Parameters.Write.Length;
     pData = (PSYNTH_DATA)pIrp->UserBuffer;
@@ -464,6 +465,19 @@ Return Value:
 
             WRITE_PORT_UCHAR(SynthBase + (IoPort - SYNTH_PORT),
                              (UCHAR)pData->PortData);
+
+            if ( IoPort == 0x38A )
+            {
+                PortData[0] = LOBYTE(pData->PortData);
+            }
+            else if ( IoPort == 0x38A )
+            {
+                PortData[0] |= pData->PortData << 8;
+            }
+            else
+            {
+                FMRegs[PortData][0]] = port->PortData;
+            }
 
             //
             // Make sure the SYNTH can keep up

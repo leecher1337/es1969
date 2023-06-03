@@ -1,2 +1,4 @@
-DIRS=dll        \
+DIRS=soundlib   \
+     synthlib   \
+     dll        \
      driver

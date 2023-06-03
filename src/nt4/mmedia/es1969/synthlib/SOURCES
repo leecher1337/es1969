@@ -2,7 +2,7 @@
 #   Create a generic synth library
 #
 
-TARGETNAME=synthlib
+TARGETNAME=esssynth
 TARGETPATH=$(BASEDIR)\lib
 TARGETTYPE=LIBRARY
 
@@ -13,11 +13,10 @@ TARGETLIBS=$(BASEDIR)\lib\*\$(DDKBUILDENV)\user32.lib   \
            $(BASEDIR)\lib\*\$(DDKBUILDENV)\advapi32.lib   \
            $(BASEDIR)\lib\*\$(DDKBUILDENV)\winmm.lib
 
-INCLUDES=..\inc;..\drvlib\inc
+INCLUDES=..\..\inc;..\..\drvlib\inc
 
 C_DEFINES=-DUNICODE
 
 SOURCES=midint.c    \
         midi.c      \
-        adlib.c     \
-        opl3.c
+        natv.c

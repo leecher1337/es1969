@@ -1,9 +1,8 @@
 [Source Media Descriptions]
-    1  = "Sound Blaster Driver"  , TAGFILE = disk1
+    1  = "AudioDrive Driver"  , TAGFILE = disk1
 
 [Installable.Drivers]
-soundblaster = 1:sndblst.dll, "wave,MIDI,aux,mixer", "Creative Labs Sound Blaster 1.X, Pro, 16" ,,,
+audiodrive = 1:auddrive.dll, "wave,MIDI,aux,mixer", "ES1879/1869/1878/1868/1887/1888 AudioDrive 2.00.82" ,,,
 
-[soundblaster]
-1:sndblst.sys
-
+[audiodrive]
+1:auddrive.sys

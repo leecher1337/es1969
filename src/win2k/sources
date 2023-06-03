@@ -1,6 +1,6 @@
 # Copyright (c) 1995-2000 Microsoft Corporation.  All rights reserved.
 
-TARGETNAME=mssb16
+TARGETNAME=es1969
 TARGETTYPE=DRIVER
 TARGETPATH=obj
 
@@ -29,6 +29,9 @@ LINKER_FLAGS=-map
 SOURCES=\
         adapter.cpp     \
         common.cpp      \
+        minfm.cpp     \
         mintopo.cpp     \
+        minuart.cpp     \
         minwave.cpp     \
-        sb16.rc
+        natv.cpp \
+        es1969.rc

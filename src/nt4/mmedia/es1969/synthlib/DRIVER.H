@@ -49,6 +49,9 @@ extern MMRESULT MidiGetVolume(LPDWORD lpVolume);
 
 #define SYNTH_DATA_SIZE 80
 
+#define NUM2VOICES              (18)            /* # 2operator voices */
+#define OPS_PER_CHAN			(4)				/* Operators per channel */
+
 extern VOID FAR PASCAL MidiSendFM (DWORD wAddress, BYTE bValue);
 extern VOID FAR PASCAL MidiNewVolume (WORD wLeft, WORD wRight);
 extern WORD FAR PASCAL MidiInit (VOID);
@@ -62,7 +65,7 @@ extern BYTE gbVelocityAtten[32];
 /*
  * midi device type - determined by kernel driver
  */
-UINT gMidiType;
+extern UINT gMidiType;
 /*
  * values for gMidiType - set in MidiOpenDevice
  */
@@ -111,6 +114,19 @@ typedef struct portalloc_tag {
     DWORD               dwFlags;        // allocation flags
 }PORTALLOC, NEAR *NPPORTALLOC;
 
+typedef struct _voiceStruct {
+        BYTE    flags1;
+        USHORT  wTime;                  /* time that was turned on/off;
+                                           0 time indicates that its not in use */
+        BYTE    bChannel;               /* channel played on */
+        BYTE    bNote;                  /* note played */
+        BYTE    bVelocity;              /* velocity */
+        USHORT  detune[OPS_PER_CHAN];   /* original pitch, for pitch bend */
+        BYTE    bPatch;                 /* what patch is the note,
+                                           drums patch = drum note + 128 */
+        BYTE    reg5[OPS_PER_CHAN];		/* Delay, block */
+        BYTE    reg1[OPS_PER_CHAN];		/* KSL and Attenuation*/
+} voiceStruct;
 
 
 
@@ -134,7 +150,7 @@ typedef struct portalloc_tag {
 /* midi.c */
 extern BYTE	gbMidiInUse;		/* if MIDI is in use */
 
-extern HMODULE  ghModule;           // our module handle
+extern HMODULE  hDriverModule1;           // our module handle
 
 /***************************************************************************
 

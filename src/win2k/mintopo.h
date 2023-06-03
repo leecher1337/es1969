@@ -1,42 +1,64 @@
 /*****************************************************************************
- * mintopo.h - SB16 topology miniport private definitions
+ * mintopo.h - ESS topology miniport private definitions
  *****************************************************************************
- * Copyright (c) 1997-2000 Microsoft Corporation. All Rights Reserved.
+ * Copyright (c) 2023 leecher@dose.0wnz.at  All rights reserved.
  */
 
-#ifndef _SB16TOPO_PRIVATE_H_
-#define _SB16TOPO_PRIVATE_H_
+#ifndef _ESSTOPO_PRIVATE_H_
+#define _ESSTOPO_PRIVATE_H_
 
 #include "common.h"
 
+#define NODENUM     39  // Not sure why not 32 
+
+typedef struct
+{
+    BYTE Reg;
+    BYTE Val;
+} MIXER_TABLE;
+
+typedef struct 
+{
+  DWORD Channel[2];
+  DWORD Pin;
+} LINEOUT_VOLUME;
 
 /*****************************************************************************
  * Classes
  */
 
 /*****************************************************************************
- * CMiniportTopologySB16
+ * CMiniportTopologyESS
  *****************************************************************************
- * SB16 topology miniport.  This object is associated with the device and is
+ * ESS topology miniport.  This object is associated with the device and is
  * created when the device is started.  The class inherits IMiniportTopology
  * so it can expose this interface and CUnknown so it automatically gets
  * reference counting and aggregation support.
  */
-class CMiniportTopologySB16 
+class CMiniportTopologyESS 
 :   public IMiniportTopology, 
-#ifdef EVENT_SUPPORT
-    public ITopoMiniportSB16,
-#endif
+    public IPowerNotify,
     public CUnknown
 {
 private:
-    PADAPTERCOMMON      AdapterCommon;      // Adapter common object.
-#ifdef EVENT_SUPPORT
-    PPORTEVENTS         PortEvents;
-#endif
+    PPORTTOPOLOGY       m_Port;
+    PPORTEVENTS         m_PortEvents;
+    
+    PUCHAR              m_BaseAddress0;
+    DWORD               m_BoardId;
+    BYTE                m_VolumeRegs[NODENUM];
+    LINEOUT_VOLUME      m_LineVolumes[NODENUM];
+    SETTING             m_VolumesIn[10];
+    SETTING             m_VolumesOut[10];
+    BOOLEAN             m_HideVolumes[NODENUM];
+    SYSTEM_POWER_STATE  m_PowerState;
+    UCHAR               m_SpatializerLevel;
+    UCHAR               m_MonoOutSource;
+    BOOLEAN             m_MicPreampGain;
+    DWORD               m_MuxPin;
 
     /*************************************************************************
-     * CMiniportTopologySB16 methods
+     * CMiniportTopologyESS methods
      *
      * These are private member functions used internally by the object.  See
      * MINIPORT.CPP for specific descriptions.
@@ -45,21 +67,49 @@ private:
     (
         IN      PRESOURCELIST   ResourceList
     );
-    BYTE ReadBitsFromMixer
-    (
-        BYTE Reg,
-        BYTE Bits,
-        BYTE Shift
+    VOID InitSpatializer
+    (   void
     );
-    void WriteBitsToMixer
+    VOID InitNodeValues
+    (   void
+    );
+    VOID SetNodeValue
     (
-        BYTE Reg,
-        BYTE Bits,
-        BYTE Shift,
-        BYTE Value
+        IN      ULONG      Node
+    );
+    VOID InitTables
+    (   void
+    );
+    VOID GetRegistrySettings
+    (   void
+    );
+    VOID SaveRegistrySettings
+    (   void
+    );
+    BOOLEAN MixerSetMux
+    (
+        DWORD pin
+    );
+    USHORT GetHwVol
+    (
+        IN      ULONG      Node
+    );
+    BYTE GetMasterHwVol
+    (
+        IN      int      Volume
+    );
+    VOID GetMuteFromHardware
+    (
+        IN      ULONG      Node
+    );
+    VOID GetVolumeFromHardware
+    (
+        IN      ULONG      Node
     );
 
 public:
+    PADAPTERCOMMON      m_AdapterCommon;      // Adapter common object.
+    
     /*************************************************************************
      * The following two macros are from STDUNK.H.  DECLARE_STD_UNKNOWN()
      * defines inline IUnknown implementations that use CUnknown's aggregation
@@ -70,9 +120,9 @@ public:
      * create macro (in MINIPORT.CPP) uses this constructor.
      */
     DECLARE_STD_UNKNOWN();
-    DEFINE_STD_CONSTRUCTOR(CMiniportTopologySB16);
+    DEFINE_STD_CONSTRUCTOR(CMiniportTopologyESS);
 
-    ~CMiniportTopologySB16();
+    ~CMiniportTopologyESS();
 
     /*************************************************************************
      * IMiniport methods
@@ -91,6 +141,13 @@ public:
     ,   OUT     PULONG          ResultantFormatLength
     )
     {
+        UNREFERENCED_PARAMETER(PinId);
+        UNREFERENCED_PARAMETER(DataRange);
+        UNREFERENCED_PARAMETER(MatchingDataRange);
+        UNREFERENCED_PARAMETER(OutputBufferLength);
+        UNREFERENCED_PARAMETER(ResultantFormat);
+        UNREFERENCED_PARAMETER(ResultantFormatLength);
+
         return STATUS_NOT_IMPLEMENTED;
     }
 
@@ -104,41 +161,46 @@ public:
         IN      PPORTTOPOLOGY   Port
     );
 
-#ifdef EVENT_SUPPORT
     /*************************************************************************
-     * ITopoMiniportSB16 methods
+     * IPowerNotify methods
      */
-    STDMETHODIMP_(void) ServiceEvent (void);
-#endif
-
+    STDMETHODIMP_(void) PowerChangeNotify(
+        IN  POWER_STATE     PowerState
+    );
+    
     /*************************************************************************
      * Friends
      */
     friend
+    static
     NTSTATUS
     PropertyHandler_OnOff
     (
         IN      PPCPROPERTY_REQUEST PropertyRequest
     );
     friend
+    static
+    NTSTATUS
+    PropertyHandlerBasicSupportVolume
+    (
+        IN      PPCPROPERTY_REQUEST   PropertyRequest
+    );
+    friend
+    static
     NTSTATUS
     PropertyHandler_Level
     (
         IN      PPCPROPERTY_REQUEST PropertyRequest
     );
     friend
+    static
     NTSTATUS
-    PropertyHandler_SuperMixCaps
+    PropertyHandler_MuxSource
     (
-        IN      PPCPROPERTY_REQUEST PropertyRequest
+        IN      PPCPROPERTY_REQUEST   PropertyRequest
     );
     friend
-    NTSTATUS
-    PropertyHandler_SuperMixTable
-    (
-        IN      PPCPROPERTY_REQUEST PropertyRequest
-    );
-    friend
+    static
     NTSTATUS
     PropertyHandler_CpuResources
     (
@@ -151,7 +213,5 @@ public:
         IN      PPCEVENT_REQUEST      EventRequest
     );
 };
-
-#include "tables.h"
 
 #endif

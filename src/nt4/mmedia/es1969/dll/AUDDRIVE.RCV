@@ -2,8 +2,8 @@
 
 #define VER_FILETYPE              VFT_DLL
 #define VER_FILESUBTYPE           VFT2_DRV_INSTALLABLE
-#define VER_FILEDESCRIPTION_STR   "Configuration driver for Creative Labs Sound Blaster"
-#define VER_INTERNALNAME_STR      "sndblst.dll"
-#define VER_ORIGINALFILENAME_STR  "sndblst.dll"
+#define VER_FILEDESCRIPTION_STR   "Configuration driver for ESS"
+#define VER_INTERNALNAME_STR      "auddrive.dll"
+#define VER_ORIGINALFILENAME_STR  "auddrive.dll"
 
 #include <common.ver>

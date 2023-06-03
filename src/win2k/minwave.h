@@ -1,15 +1,11 @@
 /*****************************************************************************
- * minwave.h - SB16 wave miniport private definitions
+ * minwave.h - ESS wave miniport private definitions
  *****************************************************************************
- * Copyright (c) 1997-2000 Microsoft Corporation. All Rights Reserved.
+ * Copyright (c) 2023 leecher@dose.0wnz.at  All rights reserved.
  */
 
-#ifndef _SB16WAVE_PRIVATE_H_
-#define _SB16WAVE_PRIVATE_H_
-
-#if OVERRIDE_DMA_CHANNEL
-#define PC_IMPLEMENTATION
-#endif // OVERRIDE_DMA_CHANNEL
+#ifndef _MINWAVE_PRIVATE_H_
+#define _MINWAVE_PRIVATE_H_
 
 #include "common.h"
 
@@ -22,21 +18,22 @@
  */
 
 /*****************************************************************************
- * CMiniportWaveCyclicSB16
+ * CMiniportWaveSolo
  *****************************************************************************
- * SB16 wave miniport.  This object is associated with the device and is
+ * ESS wave miniport.  This object is associated with the device and is
  * created when the device is started.  The class inherits IMiniportWaveCyclic
  * so it can expose this interface and CUnknown so it automatically gets
  * reference counting and aggregation support.
  */
-class CMiniportWaveCyclicSB16
+class CMiniportWaveSolo
 :   public IMiniportWaveCyclic,
-    public IWaveMiniportSB16,
+    public IPowerNotify,
     public CUnknown
 {
 private:
     PADAPTERCOMMON      AdapterCommon;              // Adapter common object.
     PPORTWAVECYCLIC     Port;                       // Callback interface.
+    PPCFILTER_DESCRIPTOR FilterDescriptor;          // FilterDescriptor
 
     ULONG               NotificationInterval;       // In milliseconds.
     ULONG               SamplingFrequency;          // Frames per second.
@@ -45,25 +42,26 @@ private:
     BOOLEAN             AllocatedRender;            // Render in use.
     BOOLEAN             Allocated8Bit;              // 8-bit DMA in use.
     BOOLEAN             Allocated16Bit;             // 16-bit DMA in use.
+    
+    SYSTEM_POWER_STATE  PowerState;                 // Power state 
+    BYTE                SaveExtSampleRate;
+    BYTE                SaveFilterDiv;
+    BYTE                SaveA2SampleRate;
+    BYTE                SaveA2ClockRate;
 
-    PDMACHANNELSLAVE    DmaChannel8;                // Abstracted channel.
-    PDMACHANNELSLAVE    DmaChannel16;               // Abstracted channel.
+    PDMACHANNEL         DmaChannel8;                // Abstracted channel.
+    PDMACHANNEL         DmaChannel16;               // Abstracted channel.
 
     PSERVICEGROUP       ServiceGroup;               // For notification.
     KMUTEX              SampleRateSync;             // Sync for sample rate changes.
+    DWORD               Running;                    // Instances running
 
     /*************************************************************************
-     * CMiniportWaveCyclicSB16 methods
+     * CMiniportWaveSolo methods
      *
      * These are private member functions used internally by the object.  See
      * MINIPORT.CPP for specific descriptions.
      */
-    BOOLEAN ConfigureDevice
-    (
-        IN      ULONG   Interrupt,
-        IN      ULONG   DMA8Bit,
-        IN      ULONG   DMA16Bit
-    );
     NTSTATUS ProcessResources
     (
         IN      PRESOURCELIST   ResourceList
@@ -84,56 +82,55 @@ public:
      * create macro (in MINIPORT.CPP) uses this constructor.
      */
     DECLARE_STD_UNKNOWN();
-    DEFINE_STD_CONSTRUCTOR(CMiniportWaveCyclicSB16);
+    DEFINE_STD_CONSTRUCTOR(CMiniportWaveSolo);
 
-    ~CMiniportWaveCyclicSB16();
+    ~CMiniportWaveSolo();
 
     /*************************************************************************
      * This macro is from PORTCLS.H.  It lists all the interface's functions.
      */
     IMP_IMiniportWaveCyclic;
-
-    /*************************************************************************
-     * IWaveMiniportSB16 methods
-     */
-    STDMETHODIMP_(void) RestoreSampleRate (void);
-    STDMETHODIMP_(void) ServiceWaveISR (void);
     
+    /*************************************************************************
+     * IPowerNotify methods
+     */
+    IMP_IPowerNotify;
+
     /*************************************************************************
      * Friends
      *
      * The miniport stream class is a friend because it needs to access the
      * private member variables of this class.
      */
-    friend class CMiniportWaveCyclicStreamSB16;
+    friend class CMiniportWaveStreamSolo;
 };
 
 /*****************************************************************************
- * CMiniportWaveCyclicStreamSB16
+ * CMiniportWaveStreamSolo
  *****************************************************************************
- * SB16 wave miniport stream.  This object is associated with a streaming pin
+ * ESS wave miniport stream.  This object is associated with a streaming pin
  * and is created when a pin is created on the filter.  The class inherits
  * IMiniportWaveCyclicStream so it can expose this interface and CUnknown so
  * it automatically gets reference counting and aggregation support.
  */
-class CMiniportWaveCyclicStreamSB16
+class CMiniportWaveStreamSolo
 :   public IMiniportWaveCyclicStream,
-    public IDrmAudioStream,
-#if OVERRIDE_DMA_CHANNEL
     public IDmaChannel,
-#endif // OVERRIDE_DMA_CHANNEL
+    public IDrmAudioStream,
     public CUnknown
 {
 private:
-    CMiniportWaveCyclicSB16 *   Miniport;       // Miniport that created us.
+    CMiniportWaveSolo *         Miniport;       // Miniport that created us.
     ULONG                       Channel;        // Index into channel list.
     BOOLEAN                     Capture;        // Capture or render.
     BOOLEAN                     Format16Bit;    // 16- or 8-bit samples.
     BOOLEAN                     FormatStereo;   // Two or one channel.
     KSSTATE                     State;          // Stop, pause, run.
-    PDMACHANNELSLAVE            DmaChannel;     // DMA channel to use.
-    BOOLEAN                     RestoreInputMixer;  // Restore input mixer.
-    UCHAR                       InputMixerLeft; // Cache for left input mixer.
+    PDMACHANNEL                 DmaChannel;     // DMA channel to use.
+    PVOID                       DmaAddress;     // DMA address to use.
+    DWORD                       PosStart;
+    DWORD                       DmaBufferSize;
+    BOOLEAN                     Active;
 
 public:
     /*************************************************************************
@@ -146,18 +143,18 @@ public:
      * create macro (in MINIPORT.CPP) uses this constructor.
      */
     DECLARE_STD_UNKNOWN();
-    DEFINE_STD_CONSTRUCTOR(CMiniportWaveCyclicStreamSB16);
+    DEFINE_STD_CONSTRUCTOR(CMiniportWaveStreamSolo);
 
-    ~CMiniportWaveCyclicStreamSB16();
+    ~CMiniportWaveStreamSolo();
     
     NTSTATUS 
     Init
     (
-        IN      CMiniportWaveCyclicSB16 *   Miniport,
+        IN      CMiniportWaveSolo *         Miniport,
         IN      ULONG                       Channel,
         IN      BOOLEAN                     Capture,
         IN      PKSDATAFORMAT               DataFormat,
-        OUT     PDMACHANNELSLAVE            DmaChannel
+        OUT     PDMACHANNEL                 DmaChannel
     );
 
     /*************************************************************************
@@ -171,13 +168,11 @@ public:
      */
     IMP_IDrmAudioStream;
     
-#if OVERRIDE_DMA_CHANNEL
     /*************************************************************************
      * Include IDmaChannel public/exported methods (portcls.h)
      *************************************************************************
      */
     IMP_IDmaChannel;
-#endif // OVERRIDE_DMA_CHANNEL
 };
 
 #endif
