@@ -448,7 +448,7 @@ void NATV_CalcNewVolume(BYTE bChannel)
         if ((voice->flags1 & VOICEFLAG_SETUP) && (voice->bChannel == bChannel || bChannel == 0xFF)) 
         {
             for (j=0; j < OPS_PER_CHAN; j++)
-                fmwrite(i * 32 + j * 8 + 1, NATV_CalcVolume(voice->reg1[j], (voice->bVelocity & 3), voice->bChannel));
+                fmwrite(i * 32 + j * 8 + 1, NATV_CalcVolume(voice->reg1[j], (voice->bVelocity >> (j*2)) & 3, voice->bChannel));
         }
     }   
 }
@@ -735,7 +735,7 @@ void  setup_operator(
     {
         transpose = ((((gBankMem[offset + 5]) << 2) & 0x7F) | (gBankMem[offset + 4] & 3));
         if (gBankMem[offset + 5] & 0x10) // signed?
-            transpose *= -1;
+            transpose |= ~0x7F;
         note += transpose;
     }
     

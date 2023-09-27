@@ -185,6 +185,10 @@ Documentation
 
 [ESSPlayMid native ASM reference implementation](https://github.com/pachuco/ESSPlayMid)
 
+[Mirror of ESS drivers from the manufacturer](https://www.zx.net.nz/mirror/www.esstech.com/techsupp/drivers.html)
+
+[List of ESS soundcards](https://dosdays.co.uk/topics/Manufacturers/ess.php)
+
 Driver is based on SB16 NTDDK driver sample and may contain some leftovers 
 from it.
 
